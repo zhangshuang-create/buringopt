@@ -1,0 +1,3 @@
+D:/SprayCode/PCLPrecess/prescess/src/build_mm_check/CMakeFiles/PlyPointCloudPreprocess.dir
+D:/SprayCode/PCLPrecess/prescess/src/build_mm_check/CMakeFiles/ALL_BUILD.dir
+D:/SprayCode/PCLPrecess/prescess/src/build_mm_check/CMakeFiles/ZERO_CHECK.dir

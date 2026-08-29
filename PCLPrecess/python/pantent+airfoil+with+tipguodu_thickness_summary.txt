@@ -1,0 +1,8 @@
+Thickness statistics
+Yellow trajectory mean thickness: 205.796598
+Yellow trajectory thickness variance: 3656.93487
+Black trajectory mean thickness: 197.750321
+Black trajectory thickness variance: 3732.7898
+More uniform by variance: yellow
+
+Explanation: the mean thickness is the average deposited coating over all valid surface samples. The variance measures coating uniformity; lower variance means the heat map is more even and has fewer thick/thin bands. This model uses a simple normal-incidence Gaussian footprint centered on uniformly sampled trajectory points.

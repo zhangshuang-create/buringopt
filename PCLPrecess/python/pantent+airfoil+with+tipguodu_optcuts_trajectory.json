@@ -1,0 +1,40 @@
+{
+  "requested_spacing": 30.0,
+  "sample_step": 7.5,
+  "seam_xyz_smoothing": "G1_cubic_coordinated_motion",
+  "seam_xyz_nominal_radius": 15.0,
+  "overtravel": 60.0,
+  "waist_pair_index": 23,
+  "waist_width": 179.76628993971616,
+  "reference_origin_uv": [
+    -256.969,
+    -28.98869
+  ],
+  "reference_x_axis_uv": [
+    0.8248849105676443,
+    -0.5653007025626358
+  ],
+  "reference_y_axis_uv": [
+    -0.5653007025626358,
+    -0.8248849105676443
+  ],
+  "extents": {
+    "lower_left": 13.13531826567512,
+    "lower_right": 51.04594954891496,
+    "upper_left": 0.0,
+    "upper_right": 16.91550399914655
+  },
+  "actual_spacings": {
+    "lower_left": NaN,
+    "lower_right": NaN,
+    "center": 29.961048323286025,
+    "upper_left": NaN,
+    "upper_right": NaN
+  },
+  "track_counts": {
+    "lower_each_side": 0,
+    "center": 7,
+    "upper_each_side": 0
+  },
+  "segment_count": 13
+}
