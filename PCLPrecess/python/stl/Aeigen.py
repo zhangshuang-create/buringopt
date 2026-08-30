@@ -36,7 +36,9 @@ ROOT = (_SCRIPT_PATH.parents[3]
 OPTCUTS_ROOT = ROOT / "third_party" / "OptCuts"
 OPTCUTS_EXE = OPTCUTS_ROOT / "build" / "Release" / "OptCuts_bin.exe"
 FINAL_FRAME_HOLD_MS = 2000
-DEFAULT_TRAJECTORY_SPACING = 30.0
+DEFAULT_TRAJECTORY_SPACING = 5.0
+DEFAULT_A_MAX = 20000.0
+DEFAULT_J_MAX = 50000.0
 DEFAULT_TRAJECTORY_SPEED = 300.0
 DEFAULT_SPRAY_DISTANCE = 0.0
 EPS = 1.0e-9
@@ -1719,7 +1721,6 @@ def _compute_3d_polyline_winding_or_side(
 
     return inside_flags
 
-
 def split_center_intrusions_3d(
     trajectory: list[TrajectorySegment],
     mesh: trimesh.Trimesh,
@@ -1743,20 +1744,75 @@ def split_center_intrusions_3d(
 
     lower_loop = extract_outer_loop("LOWER")
     upper_loop = extract_outer_loop("UPPER")
+    # Symmetric layout: only the outermost LOWER and UPPER tracks are the
+    # crossing boundaries; inner tracks are CENTER neighbours, not boundaries.
+    all_boundary_loops = [loop for loop in (lower_loop, upper_loop) if loop is not None]
+    boundary_segment_records = [
+        (a, b, loop, "LOWER" if loop is lower_loop else "UPPER")
+        for loop in all_boundary_loops
+        for a, b in zip(loop[:-1], loop[1:])
+    ]
+    boundary_segment_tree = cKDTree(np.asarray([
+        0.5 * (a + b) for a, b, _, _ in boundary_segment_records
+    ], dtype=float)) if boundary_segment_records else None
+    boundary_segment_half_lengths = np.asarray([
+        0.5 * float(np.linalg.norm(b - a))
+        for a, b, _, _ in boundary_segment_records
+    ], dtype=float)
+    boundary_segment_max_half = float(np.max(boundary_segment_half_lengths, initial=0.0))
     if lower_loop is None and upper_loop is None:
         return trajectory
 
-    boundary_trees = {
-        "LOWER": cKDTree(lower_loop) if lower_loop is not None else None,
-        "UPPER": cKDTree(upper_loop) if upper_loop is not None else None,
-    }
+    def point_to_polyline_distance(point: np.ndarray, loop: np.ndarray) -> float:
+        """Distance to the boundary polyline, rather than only its vertices."""
+        if loop is None or len(loop) == 0:
+            return float("inf")
+        best = float("inf")
+        for a, b in zip(loop[:-1], loop[1:]):
+            edge = b - a
+            denom = float(np.dot(edge, edge))
+            ratio = 0.0 if denom <= EPS else float(np.clip(
+                np.dot(point - a, edge) / denom, 0.0, 1.0
+            ))
+            best = min(best, float(np.linalg.norm(point - (a + ratio * edge))))
+        return best
 
     def likely_intersects(points: np.ndarray, region: str) -> bool:
-        tree = boundary_trees[region]
-        if tree is None or len(points) == 0:
+        loop = lower_loop if region == "LOWER" else upper_loop
+        if loop is None or len(points) == 0:
             return False
-        distances, _ = tree.query(points)
-        return bool(np.min(distances) <= intersection_tol)
+        # Candidate filtering must use the same definition as a real hit:
+        # KD-tree pruning followed by exact segment distance and opposite-side
+        # testing.  Distance alone is reserved for post-hit extension.
+        region_records = [
+            record for record in boundary_segment_records if record[3] == region
+        ]
+        if not region_records:
+            return False
+        region_tree = cKDTree(np.asarray([
+            0.5 * (q1 + q2) for q1, q2, _, _ in region_records
+        ], dtype=float))
+        max_half = max(
+            (0.5 * float(np.linalg.norm(q2 - q1)) for q1, q2, _, _ in region_records),
+            default=0.0,
+        )
+        for p1, p2 in zip(points[:-1], points[1:]):
+            active_mid = 0.5 * (p1 + p2)
+            active_half = 0.5 * float(np.linalg.norm(p2 - p1))
+            for candidate in region_tree.query_ball_point(
+                active_mid, r=active_half + max_half + intersection_tol
+            ):
+                q1, q2, candidate_loop, _ = region_records[candidate]
+                distance, u, v = _find_3d_segment_closest_point(p1, p2, q1, q2)
+                if not (distance <= intersection_tol
+                        and 1.0e-6 < u < 1.0 - 1.0e-6
+                        and 1.0e-6 < v < 1.0 - 1.0e-6):
+                    continue
+                if segment_side(p1, q1, q2, candidate_loop) * segment_side(
+                    p2, q1, q2, candidate_loop
+                ) < 0.0:
+                    return True
+        return False
 
     def signed_side(point: np.ndarray, loop: np.ndarray) -> float:
         """Return signed distance in the local boundary tangent plane."""
@@ -1788,24 +1844,68 @@ def split_center_intrusions_3d(
             inward = -inward
         return float(np.dot(point - boundary_point, inward))
 
+    def segment_side(point: np.ndarray, q1: np.ndarray, q2: np.ndarray,
+                     loop: np.ndarray) -> float:
+        """Signed side relative to the actual boundary segment being tested."""
+        tangent = np.asarray(q2, dtype=float) - np.asarray(q1, dtype=float)
+        norm = float(np.linalg.norm(tangent))
+        if norm <= EPS:
+            return 0.0
+        tangent /= norm
+        midpoint = 0.5 * (np.asarray(q1, dtype=float) + np.asarray(q2, dtype=float))
+        _, _, face_id = trimesh.proximity.closest_point(mesh, [midpoint])
+        normal = np.asarray(mesh.face_normals[int(face_id[0])], dtype=float)
+        side = np.cross(normal, tangent)
+        side_norm = float(np.linalg.norm(side))
+        if side_norm <= EPS:
+            return 0.0
+        side /= side_norm
+        if np.dot(side, np.mean(loop, axis=0) - midpoint) < 0.0:
+            side = -side
+        return float(np.dot(np.asarray(point, dtype=float) - midpoint, side))
+
     candidate_state: dict[int, bool] = {}
-    for region, loop in (("LOWER", lower_loop), ("UPPER", upper_loop)):
-        if loop is None:
-            continue
-        order = (range(len(center_tracks)) if region == "LOWER"
-                 else range(len(center_tracks) - 1, -1, -1))
-        misses = 0
-        for index in order:
-            points = np.asarray(center_tracks[index].xyz, dtype=float)
-            if len(points) < 2 or not likely_intersects(points, region):
-                misses += 1
-                if misses >= 2:
-                    break
-                continue
-            misses = 0
-            candidate_state[index] = True
+    # The LOWER and UPPER boundaries form a U-shaped pair.  Both boundaries
+    # are adjacent to both ends of CENTER, so inspect symmetric pairs
+    # (0,n-1), (1,n-2), ... rather than assigning one boundary to one end.
+    center_count = len(center_tracks)
+    left_active = True
+    right_active = True
+    for depth in range((center_count + 1) // 2):
+        left_index = depth
+        right_index = center_count - 1 - depth
+        layer_hit = False
+
+        if left_active:
+            points = np.asarray(center_tracks[left_index].xyz, dtype=float)
+            left_hit = len(points) >= 2 and any(
+                loop is not None and likely_intersects(points, region)
+                for region, loop in (("LOWER", lower_loop), ("UPPER", upper_loop))
+            )
+            if left_hit:
+                candidate_state[left_index] = True
+                layer_hit = True
+            else:
+                left_active = False
+
+        if right_active and right_index != left_index:
+            points = np.asarray(center_tracks[right_index].xyz, dtype=float)
+            right_hit = len(points) >= 2 and any(
+                loop is not None and likely_intersects(points, region)
+                for region, loop in (("LOWER", lower_loop), ("UPPER", upper_loop))
+            )
+            if right_hit:
+                candidate_state[right_index] = True
+                layer_hit = True
+            else:
+                right_active = False
+
+        # Once both ends have stopped, all deeper CENTER tracks are skipped.
+        if not layer_hit and not left_active and not right_active:
+            break
 
     new_trajectory: list[TrajectorySegment] = []
+    debug_intersections: list[np.ndarray] = []
 
     # 2. 遍历 CENTER 轨迹求交
     for seg in trajectory:
@@ -1824,123 +1924,124 @@ def split_center_intrusions_3d(
             new_trajectory.append(seg)
             continue
 
+        # The planning spacing can be several millimetres, while two real
+        # crossings may be much closer.  Densify each CENTER polyline before
+        # candidate search so a short enter/leave interval cannot be hidden
+        # inside one coarse sample segment.
+        dense_step = max(min(float(intersection_tol), 1.0), 0.25)
+        dense_points = [xyz[0]]
+        for start, end in zip(xyz[:-1], xyz[1:]):
+            length = float(np.linalg.norm(end - start))
+            count = max(1, int(math.ceil(length / dense_step)))
+            for fraction in np.linspace(1.0 / count, 1.0, count):
+                dense_points.append(start + fraction * (end - start))
+        xyz = np.asarray(dense_points, dtype=float)
+
         refined_pts = [xyz[0]]
         # Keep the locations of the actual boundary contacts separately from
         # the distance-based samples used below.  The interval between the
         # first and last contact is always intrusive, even when its middle is
         # farther than intersection_tol from either boundary.
         intersection_points = []
+        intersection_vertex_indices = []
         for i in range(len(xyz) - 1):
             p1, p2 = xyz[i], xyz[i + 1]
             intersections_on_seg = []
 
-            for loop in (lower_loop, upper_loop):
-                if loop is None:
+            local_candidates = set()
+            if boundary_segment_tree is not None:
+                active_midpoint = 0.5 * (p1 + p2)
+                active_half = 0.5 * float(np.linalg.norm(p2 - p1))
+                query_radius = active_half + boundary_segment_max_half + intersection_tol
+                local_candidates.update(boundary_segment_tree.query_ball_point(active_midpoint, r=query_radius))
+            for seg_index in local_candidates:
+                q1, q2, loop, boundary_region = boundary_segment_records[seg_index]
+                dist, u, v = _find_3d_segment_closest_point(p1, p2, q1, q2)
+                if not (
+                    dist <= intersection_tol
+                    and 1e-4 < u < (1.0 - 1e-4)
+                    and 1e-4 < v < (1.0 - 1e-4)
+                ):
                     continue
-                for j in range(len(loop) - 1):
-                    q1, q2 = loop[j], loop[j + 1]
-                    dist, u, v = _find_3d_segment_closest_point(p1, p2, q1, q2)
-                    if not (
-                        dist <= intersection_tol
-                        and 1e-4 < u < (1.0 - 1e-4)
-                        and 1e-4 < v < (1.0 - 1e-4)
-                    ):
-                        continue
-                    # A near miss within 0.1*d is intentionally considered
-                    # an intrusion; boundary endpoint contacts are ignored.
-                    point = p1 + u * (p2 - p1)
-                    intersections_on_seg.append((u, point))
+                # Proximity alone is insufficient: require crossing of the
+                # local plane associated with the actual boundary segment.
+                side_a = segment_side(p1, q1, q2, loop)
+                side_b = segment_side(p2, q1, q2, loop)
+                # Strict sign change is required; touching/tangent contact is
+                # not an enter/leave crossing.
+                if side_a * side_b >= 0.0:
+                    continue
+                point = p1 + u * (p2 - p1)
+                intersections_on_seg.append((u, point, boundary_region))
 
             intersections_on_seg.sort(key=lambda item: item[0])
-            for _, pt in intersections_on_seg:
-                intersection_points.append(pt)
+            for _, pt, boundary_region in intersections_on_seg:
+                intersection_points.append((pt, boundary_region))
                 refined_pts.append(pt)
+                intersection_vertex_indices.append(len(refined_pts) - 1)
             refined_pts.append(p2)
 
+        # Preserve the exact 3D closest-point intersections.  Re-projecting
+        # them to the mesh can move a valid crossing away from its boundary.
         refined_pts_arr = np.asarray(refined_pts, dtype=float)
-        refined_pts_arr, _, _ = trimesh.proximity.closest_point(mesh, refined_pts_arr)
+        debug_intersections.extend(point for point, _ in intersection_points)
 
         # 3. 判定微段中点是否在封闭多边形内部
         # Classify by the requested distance threshold: a segment within
         # 0.1*d of either boundary is rendered as intrusive.
-        mid_pts = 0.5 * (refined_pts_arr[:-1] + refined_pts_arr[1:])
-        seg_inside = np.zeros(len(mid_pts), dtype=bool)
-        distances_along = np.linalg.norm(
-            np.diff(refined_pts_arr, axis=0), axis=1
-        )
-        cumulative = np.concatenate([[0.0], np.cumsum(distances_along)])
-        for loop in (lower_loop, upper_loop):
-            if loop is None:
-                continue
-            loop_tree = cKDTree(loop)
-            distances, _ = loop_tree.query(mid_pts)
-            seg_inside |= distances <= intersection_tol
+        seg_labels = np.zeros(len(refined_pts_arr) - 1, dtype=int)
+        # The insertion indices are exact; nearest-neighbour remapping can
+        # collapse two physically close crossings onto one vertex.
+        # Keep only the first and last crossing for each boundary region.
+        # LOWER and UPPER are independent; never pair crossings across them.
+        selected_contacts = []
+        for boundary_region in ("LOWER", "UPPER"):
+            region_hits = [
+                (index, point)
+                for index, (point, region) in zip(
+                    intersection_vertex_indices, intersection_points
+                ) if region == boundary_region
+            ]
+            if len(region_hits) >= 2:
+                selected_contacts.append((region_hits[0][0], region_hits[-1][0], boundary_region))
 
-        # Mark the complete interval bounded by the real contacts.  This is
-        # intentionally independent of the 0.1*d distance test: the interior
-        # of an intersection must stay red even if it briefly moves away from
-        # both boundary polylines.
-        if intersection_points:
-            # The nearest-point distances above are only used to locate the
-            # inserted vertices.  Convert them to arc positions explicitly.
-            contact_indices = [int(np.argmin(np.linalg.norm(
-                refined_pts_arr - np.asarray(point, dtype=float), axis=1
-            ))) for point in intersection_points]
-            core_start = float(np.min(cumulative[contact_indices]))
-            core_end = float(np.max(cumulative[contact_indices]))
-            segment_starts = cumulative[:-1]
-            segment_ends = cumulative[1:]
-            core_inside = (segment_ends >= core_start - EPS) & (
-                segment_starts <= core_end + EPS
+        # Extend each boundary's first/last crossing while the CENTER segment
+        # remains within 0.2d of that same boundary.  This threshold expands
+        # an already-established intrusion; it never creates a crossing.
+        extension_tol = 2.0 * float(intersection_tol)
+        def near_boundary_segment(index: int, loop: np.ndarray | None) -> bool:
+            if loop is None or index < 0 or index >= len(refined_pts_arr) - 1:
+                return False
+            a, b = refined_pts_arr[index], refined_pts_arr[index + 1]
+            return (
+                point_to_polyline_distance(a, loop) <= extension_tol
+                and point_to_polyline_distance(b, loop) <= extension_tol
             )
-            seg_inside |= core_inside
 
-            # Extend each end only while the adjacent segment remains within
-            # the requested distance of a LOWER/UPPER boundary.
-            core_indices = np.flatnonzero(core_inside)
-            first_core = int(core_indices[0])
-            last_core = int(core_indices[-1])
-            while first_core > 0:
-                if any(
-                    cKDTree(loop).query(mid_pts[first_core - 1])[0]
-                    <= intersection_tol
-                    for loop in (lower_loop, upper_loop) if loop is not None
-                ):
-                    first_core -= 1
-                else:
-                    break
-            while last_core < len(seg_inside) - 1:
-                if any(
-                    cKDTree(loop).query(mid_pts[last_core + 1])[0]
-                    <= intersection_tol
-                    for loop in (lower_loop, upper_loop) if loop is not None
-                ):
-                    last_core += 1
-                else:
-                    break
-            seg_inside[first_core:last_core + 1] = True
+        intervals = []
+        for first, second, boundary_region in selected_contacts:
+            loop = lower_loop if boundary_region == "LOWER" else upper_loop
+            while first > 0 and near_boundary_segment(first - 1, loop):
+                first -= 1
+            while second < len(refined_pts_arr) - 1 and near_boundary_segment(second, loop):
+                second += 1
+            intervals.append((first, second))
 
-        # Close only tiny sampling gaps between nearby hit runs.  The complete
-        # contact interval was handled above; this pass only removes isolated
-        # one-segment sampling holes outside that interval.
-        if len(seg_inside) >= 3:
-            false_runs = np.flatnonzero(
-                (~seg_inside[:-2]) & seg_inside[1:-1] & (~seg_inside[2:])
-            ) + 1
-            for gap_index in false_runs:
-                if distances_along[gap_index] <= intersection_tol:
-                    seg_inside[gap_index] = True
+        for pair_id, (first, second) in enumerate(sorted(intervals), start=1):
+            if second > first:
+                seg_labels[first:second] = pair_id
 
         # 4. 聚合并拆分生成子段
-        curr_state = bool(seg_inside[0])
+        curr_label = int(seg_labels[0])
         sub_pts = [refined_pts_arr[0]]
 
-        for i in range(len(seg_inside)):
+        for i in range(len(seg_labels)):
             sub_pts.append(refined_pts_arr[i + 1])
-            if i == len(seg_inside) - 1 or seg_inside[i + 1] != curr_state:
+            if i == len(seg_labels) - 1 or seg_labels[i + 1] != curr_label:
                 sub_arr = np.asarray(sub_pts, dtype=float)
-                region_tag = "CENTER_INTRUDED" if curr_state else "CENTER"
-                note_tag = seg.note + (" [INTRUDED]" if curr_state else " [SAFE]")
+                is_intruded = curr_label > 0
+                region_tag = "CENTER_INTRUDED" if is_intruded else "CENTER"
+                note_tag = seg.note + (" [INTRUDED]" if is_intruded else " [SAFE]")
 
                 new_trajectory.append(
                     TrajectorySegment(
@@ -1954,12 +2055,24 @@ def split_center_intrusions_3d(
                     )
                 )
 
-                if i < len(seg_inside) - 1:
-                    curr_state = bool(seg_inside[i + 1])
+                if i < len(seg_labels) - 1:
+                    curr_label = int(seg_labels[i + 1])
                     sub_pts = [refined_pts_arr[i + 1]]
 
+    if debug_intersections:
+        marker_points = np.asarray(debug_intersections, dtype=float)
+        new_trajectory.append(TrajectorySegment(
+            kind="INTERSECTION_MARKER",
+            uv=np.full((len(marker_points), 2), np.nan),
+            xyz=marker_points,
+            spray_on=False,
+            note="[DEBUG intersections]",
+            region="INTERSECTION_MARKER",
+            phases=np.zeros(len(marker_points), dtype=int),
+        ))
     return new_trajectory
 
+    
 class _UVToXYZMapper:
     def __init__(self, data: ObjUVData):
         from scipy.spatial import cKDTree
@@ -4499,8 +4612,8 @@ def optimize_trajectory_arcs_postprocess(
         trajectory: List[TrajectorySegment],
         mesh: trimesh.Trimesh,
         speed: float = 300.0,
-        a_max: float = 1000.0,
-        j_max: float = 5000.0,
+        a_max: float = DEFAULT_A_MAX,
+        j_max: float = DEFAULT_J_MAX,
         target_spacing: float = 30.0,
         sample_step: float = 1.0,
         center_boundary_limit: float | None = None,
@@ -5636,8 +5749,8 @@ class InteractiveVisualizer:
         self.optimization_events: queue.Queue = queue.Queue()
         self.optimization_generation = 0
         self.current_metadata: dict[str, object] | None = None
-        self.a_max = 1000.0  # 默认值
-        self.j_max = 5000.0  # 默认值
+        self.a_max = DEFAULT_A_MAX  # 默认值
+        self.j_max = DEFAULT_J_MAX  # 默认值
         self.hide_model = False
         self.hide_traj = False
         self.enable_energy_optimization = False
@@ -5754,6 +5867,7 @@ class InteractiveVisualizer:
             )  # 侵入 LOWER/UPPER 的 CENTER (鲜红色)
             overtravel_append_3d = vtk.vtkAppendPolyData()
             blend_append_3d = vtk.vtkAppendPolyData()
+            intersection_points_3d = []
 
             has_fixed_scan = False
             has_center_scan = False
@@ -5763,6 +5877,9 @@ class InteractiveVisualizer:
 
             for seg in trajectory:
                 if len(seg.xyz) < 2:
+                    continue
+                if seg.kind == "INTERSECTION_MARKER":
+                    intersection_points_3d.extend(np.asarray(seg.xyz, dtype=float))
                     continue
                 poly = vtk_polyline(seg.xyz)
                 region_tag = str(getattr(seg, "region", "")).upper()
@@ -5819,6 +5936,15 @@ class InteractiveVisualizer:
                 )
                 self.left_overlay_renderer.AddActor(actor)
                 self.trajectory_actors_3d.append(actor)
+
+            if intersection_points_3d:
+                marker_actor = vtk_actor(
+                    vtk_points(np.asarray(intersection_points_3d, dtype=float)),
+                    (0.0, 1.0, 0.0), opacity=1.0, width=8.0,
+                )
+                marker_actor.GetProperty().SetPointSize(10.0)
+                self.left_overlay_renderer.AddActor(marker_actor)
+                self.trajectory_actors_3d.append(marker_actor)
 
         # 绘制过渡空跑轨迹 (绿色)
         if has_overtravel:
@@ -5986,14 +6112,14 @@ class TkControlPanel:
 
         tk.Label(self.root, text="最大加速度 (mm/s²): ", font=("Arial", 11)).grid(row=3, column=0, padx=10, pady=6,
                                                                                   sticky="w")
-        self.a_max_var = tk.StringVar(value="1000.0")  # 默认值，根据实际机器人设定
+        self.a_max_var = tk.StringVar(value=str(DEFAULT_A_MAX))  # 默认值，根据实际机器人设定
         self.a_max_entry = tk.Entry(self.root, textvariable=self.a_max_var, width=15, font=("Arial", 11))
         self.a_max_entry.grid(row=3, column=1, padx=10, pady=6, sticky="ew")
 
         # 【新增】：最大加加速度输入
         tk.Label(self.root, text="最大加加速度 (mm/s³): ", font=("Arial", 11)).grid(row=4, column=0, padx=10, pady=6,
                                                                                     sticky="w")
-        self.j_max_var = tk.StringVar(value="5000.0")  # 默认值
+        self.j_max_var = tk.StringVar(value=str(DEFAULT_J_MAX))  # 默认值
         self.j_max_entry = tk.Entry(self.root, textvariable=self.j_max_var, width=15, font=("Arial", 11))
         self.j_max_entry.grid(row=4, column=1, padx=10, pady=6, sticky="ew")
 
@@ -6299,8 +6425,8 @@ def _show_result(
                 trajectory=optimized,
                 mesh=mesh,
                 speed=trajectory_speed,
-                a_max=1000.0,
-                j_max=5000.0,
+                a_max=DEFAULT_A_MAX,
+                j_max=DEFAULT_J_MAX,
                 sample_step=sample_step,
                 target_spacing=initial_spacing,
                 project_to_mesh=False,
@@ -6428,10 +6554,10 @@ def _parse_arguments() -> argparse.Namespace:
     )
 
     # 【新增】：最大加速度和最大加加速度参数
-    parser.add_argument("--a-max", type=float, default=1000.0,
-                        help="Robot maximum acceleration in mm/s² (default: 1000.0).")
-    parser.add_argument("--j-max", type=float, default=5000.0,
-                        help="Robot maximum jerk in mm/s³ (default: 5000.0).")
+    parser.add_argument("--a-max", type=float, default=DEFAULT_A_MAX,
+                        help=f"Robot maximum acceleration in mm/s² (default: {DEFAULT_A_MAX:g}).")
+    parser.add_argument("--j-max", type=float, default=DEFAULT_J_MAX,
+                        help=f"Robot maximum jerk in mm/s³ (default: {DEFAULT_J_MAX:g}).")
 
     parser.add_argument("--no-animation", action="store_true", help="Skip the OptCuts iteration animation.")
     parser.add_argument("--no-show", action="store_true", help="Do not open the final VTK/OpenGL window.")
