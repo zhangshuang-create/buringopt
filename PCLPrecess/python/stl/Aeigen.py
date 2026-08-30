@@ -1725,6 +1725,7 @@ def split_center_intrusions_3d(
     trajectory: list[TrajectorySegment],
     mesh: trimesh.Trimesh,
     intersection_tol: float = 1.0,
+    extension_tol: float = 0.0,
 ) -> list[TrajectorySegment]:
     """在真实 3D 空间进行精准求交并切分为 CENTER(黄色) 与 CENTER_INTRUDED(红色)。"""
     center_tracks = [s for s in trajectory if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "CENTER"]
@@ -2008,7 +2009,7 @@ def split_center_intrusions_3d(
         # Extend each boundary's first/last crossing while the CENTER segment
         # remains within 0.2d of that same boundary.  This threshold expands
         # an already-established intrusion; it never creates a crossing.
-        extension_tol = 2.0 * float(intersection_tol)
+        extension_tol = max(float(extension_tol), 0.0)
         def near_boundary_segment(index: int, loop: np.ndarray | None) -> bool:
             if loop is None or index < 0 or index >= len(refined_pts_arr) - 1:
                 return False
@@ -6248,7 +6249,8 @@ class TkControlPanel:
 
         optimized = split_center_intrusions_3d(
             optimized, mesh=self.visualizer.mesh,
-            intersection_tol=0.1 * new_d,
+            intersection_tol=1.0,
+            extension_tol=0.5 * new_d,
         )
 
         if not self.visualizer.enable_energy_optimization:
@@ -6637,7 +6639,8 @@ def main() -> None:
     )
 
     arc_trajectory = split_center_intrusions_3d(
-        arc_trajectory, mesh=mesh, intersection_tol=0.1 * selected_spacing
+        arc_trajectory, mesh=mesh, intersection_tol=1.0,
+        extension_tol=0.5 * selected_spacing,
     )
 
     # 对优化后的每条喷涂轨迹做曲率自适应五次最小二乘拟合；过渡段保持原样。
