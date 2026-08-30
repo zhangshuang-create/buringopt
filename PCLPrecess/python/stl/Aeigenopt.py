@@ -1,4 +1,4 @@
-#带优化的自适应优化、
+#带优化的自适应优化、这个好像带拟合
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import csv
 import json
 import math
 import os
+import shutil
 import queue
 import subprocess
 import threading
@@ -698,8 +699,9 @@ def _select_mesh_file() -> str:
     root.withdraw()
     root.update()
     path = filedialog.askopenfilename(
-        title="Select mesh for OptCuts",
+        title="Select mesh or OptCuts cache",
         filetypes=[
+            ("OptCuts cache", "*.json"),
             ("Mesh files", "*.stl *.obj *.ply *.off"),
             ("OBJ files", "*.obj"),
             ("STL files", "*.stl"),
@@ -710,6 +712,41 @@ def _select_mesh_file() -> str:
     )
     root.destroy()
     return path
+
+
+def _cutopt_cache_path(mesh_path: Path) -> Path:
+    return mesh_path.with_name(mesh_path.stem + "_cutopt.json")
+
+
+def _save_cutopt_cache(mesh_path: Path, official_input: Path, result_obj: Path,
+                       seam: PrecutSeam, cut_edges: np.ndarray) -> Path:
+    cache = _cutopt_cache_path(mesh_path)
+    result_copy = mesh_path.with_name(mesh_path.stem + "_cutopt_result.obj")
+    shutil.copy2(result_obj, result_copy)
+    payload = {
+        "format": "optcuts-cache-v1",
+        "model": {"path": str(mesh_path.resolve()), "name": mesh_path.name,
+                  "size": mesh_path.stat().st_size, "mtime_ns": mesh_path.stat().st_mtime_ns},
+        "optcuts": {"unfolded_obj": str(result_copy.resolve())},
+    }
+    cache.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Saved OptCuts cache: {cache}")
+    return cache
+
+
+def _load_cutopt_cache(cache: Path):
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    if payload.get("format") != "optcuts-cache-v1":
+        raise ValueError("Unsupported OptCuts cache format.")
+    model_path = Path(payload["model"]["path"])
+    result_obj = Path(payload["optcuts"]["unfolded_obj"])
+    for path in (model_path, result_obj):
+        if not path.exists():
+            raise FileNotFoundError(f"Cached file not found: {path}")
+    mesh = _load_mesh(str(model_path))
+    optcuts_mesh, seam = _precut_two_boundaries(mesh)
+    return (model_path, optcuts_mesh, result_obj, seam, _read_obj_uv_data(result_obj),
+            _read_obj_cut_edges(result_obj))
 
 
 def _load_mesh(path: str) -> trimesh.Trimesh:
@@ -4468,7 +4505,7 @@ def vtk_actor(polydata: vtk.vtkPolyData, color: tuple[float, float, float], opac
 
     # 【视觉增强】：将线段渲染为实体细管，能大幅减少共面闪烁，且视觉效果更高级
     actor.GetProperty().SetLineWidth(width)
-    actor.GetProperty().SetRenderLinesAsTubes(True)
+    actor.GetProperty().SetRenderLinesAsTubes(False)
 
     if wireframe:
         actor.GetProperty().SetRepresentationToWireframe()
@@ -4644,6 +4681,7 @@ class InteractiveVisualizer:
         self.window = vtk.vtkRenderWindow()
         self.window.SetWindowName("OptCuts trajectory - VTK/OpenGL (Agien)")
         self.window.SetSize(1600, 900)
+        self.window.SetMultiSamples(0)
         # 【新增】：1. 设置渲染窗口支持 2 个层级 (Layer 0 和 Layer 1)
         self.window.SetNumberOfLayers(2)
 
@@ -4696,6 +4734,7 @@ class InteractiveVisualizer:
 
         self.interactor = vtk.vtkRenderWindowInteractor()
         self.interactor.SetRenderWindow(self.window)
+        self.interactor.SetDesiredUpdateRate(30.0)
         self.interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
 
     def apply_visibility(self):
@@ -5369,17 +5408,25 @@ def main() -> None:
     selected = args.mesh or _select_mesh_file()
     if not selected:
         return
-    mesh = _load_mesh(selected)
-    optcuts_mesh, precut_seam = _precut_two_boundaries(mesh)
-    if precut_seam is None:
-        raise ValueError(
-            "Seam-aware trajectory planning requires the original burner mesh to have exactly two openings."
-        )
-    official_input = _prepare_official_input(optcuts_mesh)
-    _save_precut_seam(official_input, precut_seam)
-    result_obj = _run_official_optcuts(official_input)
-    data = _read_obj_uv_data(result_obj)
-    optimized_cut_edges = _read_obj_cut_edges(result_obj)
+    selected_path = Path(selected).resolve()
+    if selected_path.suffix.lower() == ".json":
+        mesh_path, optcuts_mesh, result_obj, precut_seam, data, optimized_cut_edges = _load_cutopt_cache(selected_path)
+        mesh = _load_mesh(str(mesh_path))
+        selected_path = mesh_path
+        print(f"Loaded OptCuts cache: {selected_path}")
+    else:
+        mesh = _load_mesh(str(selected_path))
+        optcuts_mesh, precut_seam = _precut_two_boundaries(mesh)
+        if precut_seam is None:
+            raise ValueError(
+                "Seam-aware trajectory planning requires the original burner mesh to have exactly two openings."
+            )
+        official_input = _prepare_official_input(optcuts_mesh)
+        _save_precut_seam(official_input, precut_seam)
+        result_obj = _run_official_optcuts(official_input)
+        data = _read_obj_uv_data(result_obj)
+        optimized_cut_edges = _read_obj_cut_edges(result_obj)
+        _save_cutopt_cache(selected_path, official_input, result_obj, precut_seam, optimized_cut_edges)
     if len(precut_seam.edges) and len(optimized_cut_edges):
         cut_edges = np.vstack([precut_seam.edges, optimized_cut_edges])
     elif len(precut_seam.edges):
@@ -5442,7 +5489,6 @@ def main() -> None:
             sample_step=sample_step_val,
         )
 
-    selected_path = Path(selected)
     csv_path = Path(args.trajectory_out) if args.trajectory_out else selected_path.with_name(
         selected_path.stem + "_optcuts_trajectory.csv"
     )

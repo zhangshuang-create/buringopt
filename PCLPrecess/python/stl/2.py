@@ -20,11 +20,114 @@ import vtk
 
 EPS = 1.0e-9
 VALID_EVENTS = {"SURFACE_SCAN", "OVERTRAVEL", "SEAM_JUMP", "SEAM_BLEND_3D"}
-#手动调整代码
+
 
 # =========================================================================
-# 一、 轨迹数据结构与高容错文件解析
+# 一、 极速向量化 3D 相交与局部切分算法 (KD-Tree 邻域剪枝)
 # =========================================================================
+
+
+def _segment_closest_dist_3d(
+    p1: np.ndarray, p2: np.ndarray, q1: np.ndarray, q2: np.ndarray
+) -> Tuple[float, float]:
+    """计算两线段空间最近距离及 p1-p2 上的比例参数 u。"""
+    d1 = p2 - p1
+    d2 = q2 - q1
+    r = p1 - q1
+    a = float(np.dot(d1, d1))
+    e = float(np.dot(d2, d2))
+    f = float(np.dot(d2, r))
+
+    if a <= 1e-9 or e <= 1e-9:
+        return float(np.linalg.norm(r)), 0.0
+
+    b = float(np.dot(d1, d2))
+    c = float(np.dot(d1, r))
+    denom = a * e - b * b
+
+    if abs(denom) > 1e-9:
+        u = float(np.clip((b * f - c * e) / denom, 0.0, 1.0))
+    else:
+        u = 0.0
+
+    v = (b * u + f) / e
+    if v < 0.0:
+        v = 0.0
+        u = float(np.clip(-c / a, 0.0, 1.0))
+    elif v > 1.0:
+        v = 1.0
+        u = float(np.clip((b - c) / a, 0.0, 1.0))
+
+    p_close = p1 + u * d1
+    q_close = q1 + v * d2
+    return float(np.linalg.norm(p_close - q_close)), u
+
+
+def fast_partition_active_track(
+    active_xyz: np.ndarray,
+    other_kdtree: Optional[cKDTree],
+    other_segments: np.ndarray,  # shape: (M, 2, 3) 其它所有线段端点
+    tol: float = 0.8,
+) -> List[Tuple[np.ndarray, bool]]:
+    """
+    基于全局空间哈希的极速求交：
+    1. 用 KDTree 过滤出候选干涉线段；
+    2. 局部高精求交并切分；
+    3. 耗时降至 1~2 毫秒。
+    """
+    if len(active_xyz) < 2 or other_kdtree is None or len(other_segments) == 0:
+        return [(active_xyz, False)]
+
+    # 1. 批量球查询快速锁定可能相交的线段
+    candidate_indices = other_kdtree.query_ball_point(active_xyz, r=tol * 2.0)
+
+    # 2. 沿活动线插值交点
+    refined_pts = [active_xyz[0]]
+    for i in range(len(active_xyz) - 1):
+        p1, p2 = active_xyz[i], active_xyz[i + 1]
+
+        # 获取 p1 和 p2 周围候选线段并去重
+        local_cand = set(candidate_indices[i]) | set(candidate_indices[i + 1])
+        intersections = []
+
+        for seg_idx in local_cand:
+            q1, q2 = other_segments[seg_idx]
+            dist, u = _segment_closest_dist_3d(p1, p2, q1, q2)
+            if dist <= tol and (1e-4 < u < 1.0 - 1e-4):
+                intersections.append((u, p1 + u * (p2 - p1)))
+
+        intersections.sort(key=lambda x: x[0])
+        for _, pt in intersections:
+            refined_pts.append(pt)
+        refined_pts.append(p2)
+
+    refined_pts_arr = np.asarray(refined_pts, dtype=float)
+
+    # 3. 中点干涉状态判定
+    mid_pts = 0.5 * (refined_pts_arr[:-1] + refined_pts_arr[1:])
+    dists, _ = other_kdtree.query(mid_pts)
+    seg_hit = dists <= tol * 1.2
+
+    # 4. 聚合成子段
+    sub_sections: List[Tuple[np.ndarray, bool]] = []
+    curr_state = bool(seg_hit[0])
+    curr_pts = [refined_pts_arr[0]]
+
+    for i in range(len(seg_hit)):
+        curr_pts.append(refined_pts_arr[i + 1])
+        if i == len(seg_hit) - 1 or seg_hit[i + 1] != curr_state:
+            sub_sections.append((np.asarray(curr_pts, dtype=float), curr_state))
+            if i < len(seg_hit) - 1:
+                curr_state = bool(seg_hit[i + 1])
+                curr_pts = [refined_pts_arr[i + 1]]
+
+    return sub_sections
+
+
+# =========================================================================
+# 二、 轨迹数据结构与文件解析
+# =========================================================================
+
 
 @dataclass
 class TrackSegmentData:
@@ -33,9 +136,9 @@ class TrackSegmentData:
     spray_on: bool
     region: str
     note: str
-    dense_xyz: np.ndarray  # 当前曲面插值/拟合点阵 (K, 3)
-    control_points: np.ndarray  # 位于曲面上的控制点 (N, 3)
-    mode: str = "SPLINE"  # "SPLINE" 或 "LINE"
+    dense_xyz: np.ndarray
+    control_points: np.ndarray
+    mode: str = "SPLINE"
 
 
 def _as_points(value: object, label: str) -> np.ndarray:
@@ -45,8 +148,9 @@ def _as_points(value: object, label: str) -> np.ndarray:
     return points
 
 
-def load_trajectory_file(csv_path: Path, metadata_path: Optional[Path] = None) -> List[TrackSegmentData]:
-    """从 CSV/JSON 中读取完整轨迹段落（高容错机制）。"""
+def load_trajectory_file(
+    csv_path: Path, metadata_path: Optional[Path] = None
+) -> List[TrackSegmentData]:
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV 文件不存在: {csv_path}")
 
@@ -69,7 +173,9 @@ def load_trajectory_file(csv_path: Path, metadata_path: Optional[Path] = None) -
             note = str(row.get("note", ""))
             pt = [float(row["x"]), float(row["y"]), float(row["z"])]
 
-            segments_raw.setdefault(seg_id, []).append((pt_id, event, spray_on, region, pt, note))
+            segments_raw.setdefault(seg_id, []).append(
+                (pt_id, event, spray_on, region, pt, note)
+            )
 
     control_by_segment: Dict[int, np.ndarray] = {}
     json_path = metadata_path if metadata_path else csv_path.with_suffix(".json")
@@ -78,7 +184,9 @@ def load_trajectory_file(csv_path: Path, metadata_path: Optional[Path] = None) -
             with json_path.open("r", encoding="utf-8") as f:
                 meta = json.load(f)
             for item in meta.get("control_points", []):
-                control_by_segment[int(item["segment_id"])] = _as_points(item["points"], "control_points")
+                control_by_segment[int(item["segment_id"])] = _as_points(
+                    item["points"], "control_points"
+                )
         except Exception:
             pass
 
@@ -93,46 +201,95 @@ def load_trajectory_file(csv_path: Path, metadata_path: Optional[Path] = None) -
         else:
             ctrls = pts.copy()
 
-        segments.append(TrackSegmentData(
-            segment_id=seg_id,
-            event=event,
-            spray_on=spray_on,
-            region=region,
-            note=note,
-            dense_xyz=pts,
-            control_points=ctrls,
-        ))
+        segments.append(
+            TrackSegmentData(
+                segment_id=seg_id,
+                event=event,
+                spray_on=spray_on,
+                region=region,
+                note=note,
+                dense_xyz=pts,
+                control_points=ctrls,
+            )
+        )
 
     return segments
 
 
 # =========================================================================
-# 二、 多段流形拟合与过渡缝合计算核心 (防崩溃强化)
+# 三、 多段流形拟合引擎 (带空间静态加速缓存)
 # =========================================================================
+
 
 class MultiSegmentSplineEngine:
     def __init__(self, mesh: trimesh.Trimesh, sample_step: float = 1.0):
         self.mesh = mesh
         self.sample_step = max(float(sample_step), 0.2)
         self.segments: List[TrackSegmentData] = []
-        self.active_segment_idx: int = 0
+        self.active_segment_idx: Optional[int] = None
         self.show_all_segments: bool = True
 
-    def initialize_segments(self, seg_list: List[TrackSegmentData], default_ctrl_count: int = 10):
+        # 空间检索加速缓存
+        self.other_kdtree: Optional[cKDTree] = None
+        self.other_segment_lines: np.ndarray = np.empty((0, 2, 3), dtype=float)
+
+    def initialize_segments(
+        self, seg_list: List[TrackSegmentData], default_ctrl_count: int = 16
+    ):
         self.segments = seg_list
         for seg in self.segments:
             if seg.event == "SURFACE_SCAN" and len(seg.dense_xyz) >= 2:
-                if len(seg.control_points) < 4 or len(seg.control_points) == len(seg.dense_xyz):
-                    seg.control_points = self._fit_initial_control_points(seg.dense_xyz, default_ctrl_count)
-                seg.dense_xyz = self._eval_surface_spline(seg.control_points, mode=seg.mode)
+                if len(seg.control_points) < 4 or len(seg.control_points) == len(
+                    seg.dense_xyz
+                ):
+                    seg.control_points = self._fit_initial_control_points(
+                        seg.dense_xyz, default_ctrl_count
+                    )
+                seg.dense_xyz = self._eval_surface_spline(
+                    seg.control_points, mode=seg.mode
+                )
             else:
-                seg.control_points = np.vstack([seg.dense_xyz[0], seg.dense_xyz[-1]]) if len(
-                    seg.dense_xyz) >= 2 else seg.dense_xyz.copy()
+                seg.control_points = (
+                    np.vstack([seg.dense_xyz[0], seg.dense_xyz[-1]])
+                    if len(seg.dense_xyz) >= 2
+                    else seg.dense_xyz.copy()
+                )
 
         self._rebuild_all_transitions()
+        self.rebuild_spatial_cache()
+
+    def rebuild_spatial_cache(self):
+        """为所有非活动段预构建静态检索空间树（仅在切换选择或载入时计算一次）。"""
+        if self.active_segment_idx is None:
+            self.other_kdtree = None
+            self.other_segment_lines = np.empty((0, 2, 3), dtype=float)
+            return
+
+        lines_list = []
+        pts_list = []
+        for i, s in enumerate(self.segments):
+            if (
+                i == self.active_segment_idx
+                or s.event != "SURFACE_SCAN"
+                or len(s.dense_xyz) < 2
+            ):
+                continue
+            pts = s.dense_xyz
+            pts_list.append(pts)
+            # 构建线段列表 (N-1, 2, 3)
+            lines_list.append(np.stack([pts[:-1], pts[1:]], axis=1))
+
+        if lines_list:
+            self.other_segment_lines = np.vstack(lines_list)
+            all_pts = np.vstack(pts_list)
+            # 使用线段中点加速查询
+            seg_midpoints = np.mean(self.other_segment_lines, axis=1)
+            self.other_kdtree = cKDTree(seg_midpoints)
+        else:
+            self.other_kdtree = None
+            self.other_segment_lines = np.empty((0, 2, 3), dtype=float)
 
     def _clean_points(self, pts: np.ndarray) -> np.ndarray:
-        """去除连续重合点，防止底层 Fortran/C 数组除零崩溃。"""
         pts = np.asarray(pts, dtype=float)
         if len(pts) < 2:
             return pts
@@ -141,7 +298,9 @@ class MultiSegmentSplineEngine:
         cleaned = pts[keep]
         return cleaned if len(cleaned) >= 2 else pts
 
-    def _fit_initial_control_points(self, polyline: np.ndarray, num_ctrl: int) -> np.ndarray:
+    def _fit_initial_control_points(
+        self, polyline: np.ndarray, num_ctrl: int
+    ) -> np.ndarray:
         pts = self._clean_points(polyline)
         dists = np.linalg.norm(np.diff(pts, axis=0), axis=1)
         dists = np.maximum(dists, 1e-4)
@@ -159,7 +318,9 @@ class MultiSegmentSplineEngine:
         proj_ctrl[-1] = pts[-1]
         return proj_ctrl
 
-    def _eval_surface_spline(self, ctrl_pts: np.ndarray, mode: str = "SPLINE") -> np.ndarray:
+    def _eval_surface_spline(
+        self, ctrl_pts: np.ndarray, mode: str = "SPLINE"
+    ) -> np.ndarray:
         pts = self._clean_points(ctrl_pts)
         n = len(pts)
         if n < 2:
@@ -168,14 +329,12 @@ class MultiSegmentSplineEngine:
         if mode == "LINE" or n < 3:
             return self._eval_linear_surface(pts)
 
-        # 构建严格单调递增的参数节点序列
         dists = np.linalg.norm(np.diff(pts, axis=0), axis=1)
         dists = np.maximum(dists, 1e-4)
         cum = np.r_[0.0, np.cumsum(dists)]
         total = max(cum[-1], 1e-5)
         u_knots = cum / total
 
-        # 严格强制单调递增
         for i in range(1, len(u_knots)):
             if u_knots[i] <= u_knots[i - 1]:
                 u_knots[i] = u_knots[i - 1] + 1e-4
@@ -183,7 +342,9 @@ class MultiSegmentSplineEngine:
 
         k_deg = min(3, n - 1)
         try:
-            tck, _ = interpolate.splprep([pts[:, 0], pts[:, 1], pts[:, 2]], u=u_knots, k=k_deg, s=0.0)
+            tck, _ = interpolate.splprep(
+                [pts[:, 0], pts[:, 1], pts[:, 2]], u=u_knots, k=k_deg, s=0.0
+            )
             n_eval = max(24, int(np.ceil(total / self.sample_step)))
             u_eval = np.linspace(0.0, 1.0, n_eval)
             eval_pts = np.column_stack(interpolate.splev(u_eval, tck))
@@ -223,8 +384,13 @@ class MultiSegmentSplineEngine:
         if ctrl_idx == 0 or ctrl_idx == len(seg.control_points) - 1:
             self._rebuild_neighbor_transitions(seg_idx)
 
-    def _c1_connector(self, p_start: np.ndarray, p_end: np.ndarray,
-                      t_start: np.ndarray, t_end: np.ndarray) -> np.ndarray:
+    def _c1_connector(
+        self,
+        p_start: np.ndarray,
+        p_end: np.ndarray,
+        t_start: np.ndarray,
+        t_end: np.ndarray,
+    ) -> np.ndarray:
         gap = float(np.linalg.norm(p_end - p_start))
         if gap <= 1.0e-7:
             return np.vstack([p_start, p_end])
@@ -235,30 +401,60 @@ class MultiSegmentSplineEngine:
         n_samples = max(4, int(np.ceil(gap / self.sample_step)) + 1)
         u = np.linspace(0.0, 1.0, n_samples)[:, None]
 
-        curve = ((2 * u ** 3 - 3 * u ** 2 + 1) * p_start + (u ** 3 - 2 * u ** 2 + u) * handle * t0 +
-                 (-2 * u ** 3 + 3 * u ** 2) * p_end + (u ** 3 - u ** 2) * handle * t1)
+        curve = (
+            (2 * u**3 - 3 * u**2 + 1) * p_start
+            + (u**3 - 2 * u**2 + u) * handle * t0
+            + (-2 * u**3 + 3 * u**2) * p_end
+            + (u**3 - u**2) * handle * t1
+        )
         return curve
 
     def _rebuild_neighbor_transitions(self, seg_idx: int):
-        if seg_idx > 0 and self.segments[seg_idx - 1].event in {"OVERTRAVEL", "SEAM_JUMP"}:
+        if seg_idx > 0 and self.segments[seg_idx - 1].event in {
+            "OVERTRAVEL",
+            "SEAM_JUMP",
+        }:
             prev_seg = self.segments[seg_idx - 1]
             curr_seg = self.segments[seg_idx]
             p0 = prev_seg.dense_xyz[0]
             p1 = curr_seg.dense_xyz[0]
-            t0 = (prev_seg.dense_xyz[1] - prev_seg.dense_xyz[0]) if len(prev_seg.dense_xyz) >= 2 else (p1 - p0)
-            t1 = (curr_seg.dense_xyz[1] - curr_seg.dense_xyz[0]) if len(curr_seg.dense_xyz) >= 2 else (p1 - p0)
+            t0 = (
+                (prev_seg.dense_xyz[1] - prev_seg.dense_xyz[0])
+                if len(prev_seg.dense_xyz) >= 2
+                else (p1 - p0)
+            )
+            t1 = (
+                (curr_seg.dense_xyz[1] - curr_seg.dense_xyz[0])
+                if len(curr_seg.dense_xyz) >= 2
+                else (p1 - p0)
+            )
             prev_seg.dense_xyz = self._c1_connector(p0, p1, t0, t1)
-            prev_seg.control_points = np.vstack([prev_seg.dense_xyz[0], prev_seg.dense_xyz[-1]])
+            prev_seg.control_points = np.vstack(
+                [prev_seg.dense_xyz[0], prev_seg.dense_xyz[-1]]
+            )
 
-        if seg_idx < len(self.segments) - 1 and self.segments[seg_idx + 1].event in {"OVERTRAVEL", "SEAM_JUMP"}:
+        if seg_idx < len(self.segments) - 1 and self.segments[seg_idx + 1].event in {
+            "OVERTRAVEL",
+            "SEAM_JUMP",
+        }:
             next_seg = self.segments[seg_idx + 1]
             curr_seg = self.segments[seg_idx]
             p0 = curr_seg.dense_xyz[-1]
             p1 = next_seg.dense_xyz[-1]
-            t0 = (curr_seg.dense_xyz[-1] - curr_seg.dense_xyz[-2]) if len(curr_seg.dense_xyz) >= 2 else (p1 - p0)
-            t1 = (next_seg.dense_xyz[-1] - next_seg.dense_xyz[-2]) if len(next_seg.dense_xyz) >= 2 else (p1 - p0)
+            t0 = (
+                (curr_seg.dense_xyz[-1] - curr_seg.dense_xyz[-2])
+                if len(curr_seg.dense_xyz) >= 2
+                else (p1 - p0)
+            )
+            t1 = (
+                (next_seg.dense_xyz[-1] - next_seg.dense_xyz[-2])
+                if len(next_seg.dense_xyz) >= 2
+                else (p1 - p0)
+            )
             next_seg.dense_xyz = self._c1_connector(p0, p1, t0, t1)
-            next_seg.control_points = np.vstack([next_seg.dense_xyz[0], next_seg.dense_xyz[-1]])
+            next_seg.control_points = np.vstack(
+                [next_seg.dense_xyz[0], next_seg.dense_xyz[-1]]
+            )
 
     def _rebuild_all_transitions(self):
         for i in range(len(self.segments)):
@@ -267,8 +463,9 @@ class MultiSegmentSplineEngine:
 
 
 # =========================================================================
-# 三、 VTK 交互式表面拖拽器
+# 四、 VTK 交互拖拽器
 # =========================================================================
+
 
 class SurfaceTrackInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
     def __init__(self, app: SurfaceCurveApp):
@@ -299,14 +496,18 @@ class SurfaceTrackInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
             ctrl_idx = self.app.handle_actor_map[actor]
             self.drag_ctrl_idx = ctrl_idx
             self.is_dragging = True
-            actor.GetProperty().SetColor(1.0, 0.95, 0.0)
+            actor.GetProperty().SetColor(1.0, 1.0, 1.0)
             self.app.render()
             return
 
         self.OnLeftButtonDown()
 
     def on_mouse_move(self, obj, event):
-        if self.is_dragging and self.drag_ctrl_idx is not None:
+        if (
+            self.is_dragging
+            and self.drag_ctrl_idx is not None
+            and self.app.engine.active_segment_idx is not None
+        ):
             mouse_pos = self.GetInteractor().GetEventPosition()
             renderer = self.app.renderer
 
@@ -331,8 +532,9 @@ class SurfaceTrackInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
 
 
 # =========================================================================
-# 四、 VTK 视口与可视化渲染主程序
+# 五、 VTK 主渲染应用
 # =========================================================================
+
 
 class SurfaceCurveApp:
     def __init__(self, mesh: trimesh.Trimesh):
@@ -343,7 +545,9 @@ class SurfaceCurveApp:
         self.renderer.SetBackground(0.12, 0.14, 0.18)
 
         self.render_window = vtk.vtkRenderWindow()
-        self.render_window.SetWindowName("3D Mesh Trajectory Designer - [Surface Spline & Solo Mode]")
+        self.render_window.SetWindowName(
+            "3D Mesh Trajectory Designer - [Fast Intersection Mode]"
+        )
         self.render_window.SetSize(1450, 900)
         self.render_window.AddRenderer(self.renderer)
 
@@ -354,6 +558,8 @@ class SurfaceCurveApp:
         self.renderer.AddActor(self.mesh_actor)
 
         self.track_actors: Dict[int, vtk.vtkActor] = {}
+        self.active_segment_sub_actors: List[vtk.vtkActor] = []
+
         self.handle_actors: List[vtk.vtkActor] = []
         self.handle_actor_map: Dict[vtk.vtkActor, int] = {}
 
@@ -402,33 +608,33 @@ class SurfaceCurveApp:
         for seg_idx in range(len(self.engine.segments)):
             self._create_or_update_track_actor(seg_idx)
 
+        self._render_active_segment_partitioned()
         self.refresh_handles()
         self._update_text()
         self.render()
 
     def update_active_segment_visuals(self):
         curr_idx = self.engine.active_segment_idx
-        self._create_or_update_track_actor(curr_idx)
-        if curr_idx > 0:
-            self._create_or_update_track_actor(curr_idx - 1)
-        if curr_idx < len(self.engine.segments) - 1:
-            self._create_or_update_track_actor(curr_idx + 1)
+        if curr_idx is not None:
+            if curr_idx > 0:
+                self._create_or_update_track_actor(curr_idx - 1)
+            if curr_idx < len(self.engine.segments) - 1:
+                self._create_or_update_track_actor(curr_idx + 1)
 
-        seg = self.engine.segments[curr_idx]
-        for actor, c_i in list(self.handle_actor_map.items()):
-            if c_i < len(seg.control_points):
-                pt = seg.control_points[c_i]
-                actor.SetPosition(float(pt[0]), float(pt[1]), float(pt[2]))
+            self._render_active_segment_partitioned()
+
+            seg = self.engine.segments[curr_idx]
+            for actor, c_i in list(self.handle_actor_map.items()):
+                if c_i < len(seg.control_points):
+                    pt = seg.control_points[c_i]
+                    actor.SetPosition(float(pt[0]), float(pt[1]), float(pt[2]))
 
         self._update_text()
         self.render()
 
-    def _create_or_update_track_actor(self, seg_idx: int):
-        seg = self.engine.segments[seg_idx]
-        pts = seg.dense_xyz
-        if len(pts) < 2:
-            return
-
+    def _create_polyline_actor(
+        self, pts: np.ndarray, color: tuple, width: float
+    ) -> vtk.vtkActor:
         vtk_pts = vtk.vtkPoints()
         for p in pts:
             vtk_pts.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
@@ -450,36 +656,85 @@ class SurfaceCurveApp:
         except AttributeError:
             pass
 
-        if seg_idx in self.track_actors:
-            actor = self.track_actors[seg_idx]
-            actor.SetMapper(mapper)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetRenderLinesAsTubes(True)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetLineWidth(width)
+        return actor
+
+    def _render_active_segment_partitioned(self):
+        """【毫秒级极速着色】：仅计算活动段自身交点，相交段变黄，安全段变绿。"""
+        for a in self.active_segment_sub_actors:
+            self.renderer.RemoveActor(a)
+        self.active_segment_sub_actors.clear()
+
+        curr_idx = self.engine.active_segment_idx
+        if curr_idx is None or not (0 <= curr_idx < len(self.engine.segments)):
+            return
+
+        active_seg = self.engine.segments[curr_idx]
+        if len(active_seg.dense_xyz) < 2:
+            return
+
+        # 极速空间检索分段
+        sub_sections = fast_partition_active_track(
+            active_seg.dense_xyz,
+            self.engine.other_kdtree,
+            self.engine.other_segment_lines,
+            tol=0.8,
+        )
+
+        for pts, is_intersected in sub_sections:
+            if len(pts) < 2:
+                continue
+            if is_intersected:
+                # 仅交点区间高亮亮黄色
+                sub_actor = self._create_polyline_actor(
+                    pts, color=(1.0, 0.95, 0.0), width=6.0
+                )
+            else:
+                # 未相交部分保持亮绿色
+                sub_actor = self._create_polyline_actor(
+                    pts, color=(0.0, 1.0, 0.4), width=4.5
+                )
+
+            self.renderer.AddActor(sub_actor)
+            self.active_segment_sub_actors.append(sub_actor)
+
+    def _create_or_update_track_actor(self, seg_idx: int):
+        if (
+            self.engine.active_segment_idx is not None
+            and seg_idx == self.engine.active_segment_idx
+        ):
+            if seg_idx in self.track_actors:
+                self.track_actors[seg_idx].SetVisibility(False)
+            return
+
+        seg = self.engine.segments[seg_idx]
+        pts = seg.dense_xyz
+        if len(pts) < 2:
+            return
+
+        if seg.event == "SURFACE_SCAN":
+            color = (0.88, 0.12, 0.12)  # 邻居表面线：红色
+            width = 3.0
         else:
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-            actor.GetProperty().SetRenderLinesAsTubes(True)
-            self.renderer.AddActor(actor)
-            self.track_actors[seg_idx] = actor
+            color = (0.1, 0.8, 0.2)  # 过渡段：绿色
+            width = 2.0
 
-        is_active = (seg_idx == self.engine.active_segment_idx)
+        if seg_idx in self.track_actors:
+            self.renderer.RemoveActor(self.track_actors[seg_idx])
 
-        # 全显示 vs 仅显示选中段
+        actor = self._create_polyline_actor(pts, color=color, width=width)
+
         if not self.engine.show_all_segments:
-            actor.SetVisibility(is_active)
+            actor.SetVisibility(False)
         else:
             actor.SetVisibility(True)
 
-        if is_active and seg.event == "SURFACE_SCAN":
-            actor.GetProperty().SetColor(0.0, 1.0, 0.4)
-            actor.GetProperty().SetLineWidth(4.5)
-        elif is_active:
-            actor.GetProperty().SetColor(1.0, 0.9, 0.2)
-            actor.GetProperty().SetLineWidth(4.0)
-        elif seg.event == "SURFACE_SCAN":
-            actor.GetProperty().SetColor(0.88, 0.12, 0.12)
-            actor.GetProperty().SetLineWidth(3.0)
-        else:
-            actor.GetProperty().SetColor(0.1, 0.8, 0.2)
-            actor.GetProperty().SetLineWidth(2.0)
+        self.renderer.AddActor(actor)
+        self.track_actors[seg_idx] = actor
 
     def refresh_handles(self):
         for actor in self.handle_actors:
@@ -487,6 +742,8 @@ class SurfaceCurveApp:
         self.handle_actors.clear()
         self.handle_actor_map.clear()
 
+        if self.engine.active_segment_idx is None:
+            return
         if not (0 <= self.engine.active_segment_idx < len(self.engine.segments)):
             return
 
@@ -520,16 +777,17 @@ class SurfaceCurveApp:
             self.handle_actors.append(actor)
             self.handle_actor_map[actor] = ctrl_idx
 
-    def select_segment(self, seg_idx: int):
-        if 0 <= seg_idx < len(self.engine.segments):
-            self.engine.active_segment_idx = seg_idx
-            self.update_all_visuals()
+    def select_segment(self, seg_idx: Optional[int]):
+        self.engine.active_segment_idx = seg_idx
+        # 仅在切换选择时重建一次 KD-Tree 缓存
+        self.engine.rebuild_spatial_cache()
+        self.update_all_visuals()
 
     def set_display_mode(self, show_all: bool):
         self.engine.show_all_segments = show_all
         for seg_idx, actor in self.track_actors.items():
             if not show_all:
-                actor.SetVisibility(seg_idx == self.engine.active_segment_idx)
+                actor.SetVisibility(False)
             else:
                 actor.SetVisibility(True)
         self.render()
@@ -539,14 +797,27 @@ class SurfaceCurveApp:
             self.info_text_actor.SetInput("请在控制台加载轨迹 CSV 文件")
             return
 
+        if self.engine.active_segment_idx is None:
+            self.info_text_actor.SetInput(
+                f"未选中任何轨迹（不执行相交判定） | 总段数: {len(self.engine.segments)}"
+            )
+            return
+
         seg = self.engine.segments[self.engine.active_segment_idx]
-        mode_name = "五次/三次 B 样条 (Spline)" if seg.mode == "SPLINE" else "曲面直线段 (Line)"
-        disp_name = "【显示全部轨迹】" if self.engine.show_all_segments else "【仅显示选中段 (Solo)】"
+        mode_name = (
+            "五次/三次 B 样条 (Spline)" if seg.mode == "SPLINE" else "曲面直线段 (Line)"
+        )
+        disp_name = (
+            "【显示全部轨迹】"
+            if self.engine.show_all_segments
+            else "【仅显示选中段 (Solo)】"
+        )
+
         info = (
             f"当前活动段: Segment #{seg.segment_id} [{seg.event} - {seg.region}] | 总段数: {len(self.engine.segments)}\n"
-            f"显示模式: {disp_name} | 曲线算法: {mode_name}\n"
-            f"控制点数量: {len(seg.control_points)} | 采样点数: {len(seg.dense_xyz)}\n"
-            f"操作提示: 鼠标左键直接拖动控制球即可贴体变形；在控制面板中可快速切换段落或显示模式。"
+            f"显示模式: {disp_name} | 曲线模式: {mode_name}\n"
+            f"控制点数: {len(seg.control_points)} | 采样点数: {len(seg.dense_xyz)}\n"
+            f"提示: 空间加速索引已开启；拖拽时仅活动轨迹产生相交的区间实时变黄，邻居保持原色。"
         )
         self.info_text_actor.SetInput(info)
 
@@ -564,15 +835,16 @@ class SurfaceCurveApp:
 
 
 # =========================================================================
-# 五、 独立 Tkinter 控制面板 UI
+# 六、 控制面板与主入口
 # =========================================================================
+
 
 class TkControlPanel:
     def __init__(self, app: SurfaceCurveApp, tk_root: tk.Tk):
         self.app = app
         self.root = tk_root
         self.root.title("轨迹分段编辑与显示控制台")
-        self.root.geometry("420x520+50+50")
+        self.root.geometry("420x540+40+40")
         self.root.wm_attributes("-topmost", True)
         self.root.deiconify()
 
@@ -582,45 +854,73 @@ class TkControlPanel:
 
         btn_row = tk.Frame(f_frame)
         btn_row.pack(fill="x")
-        tk.Button(btn_row, text="打开轨迹 CSV", command=self.open_csv_dialog,
-                  bg="#1948CD", fg="white", font=("Arial", 9, "bold")).pack(side="left", expand=True, fill="x", padx=2)
-        tk.Button(btn_row, text="保存导出 (CSV/PAQ)", command=self.export_dialog,
-                  bg="#008040", fg="white", font=("Arial", 9, "bold")).pack(side="right", expand=True, fill="x", padx=2)
+        tk.Button(
+            btn_row,
+            text="打开轨迹 CSV",
+            command=self.open_csv_dialog,
+            bg="#1948CD",
+            fg="white",
+            font=("Arial", 9, "bold"),
+        ).pack(side="left", expand=True, fill="x", padx=2)
+        tk.Button(
+            btn_row,
+            text="保存导出 (CSV/PAQ)",
+            command=self.export_dialog,
+            bg="#008040",
+            fg="white",
+            font=("Arial", 9, "bold"),
+        ).pack(side="right", expand=True, fill="x", padx=2)
 
         # 2. 轨迹段选择器
-        seg_frame = tk.LabelFrame(self.root, text="轨迹段切换 (Segment Selector)", padx=8, pady=6)
+        seg_frame = tk.LabelFrame(
+            self.root, text="轨迹段切换 (Segment Selector)", padx=8, pady=6
+        )
         seg_frame.pack(fill="x", padx=10, pady=5)
 
         combo_row = tk.Frame(seg_frame)
         combo_row.pack(fill="x", pady=2)
         tk.Label(combo_row, text="目标轨迹段:").pack(side="left")
         self.combo_var = tk.StringVar()
-        self.seg_combobox = ttk.Combobox(combo_row, textvariable=self.combo_var, state="readonly")
+        self.seg_combobox = ttk.Combobox(
+            combo_row, textvariable=self.combo_var, state="readonly"
+        )
         self.seg_combobox.pack(side="right", expand=True, fill="x", padx=5)
         self.seg_combobox.bind("<<ComboboxSelected>>", self.on_seg_combo_changed)
 
         nav_row = tk.Frame(seg_frame)
         nav_row.pack(fill="x", pady=4)
-        tk.Button(nav_row, text="◀ 上一段 (Prev)", command=self.prev_segment).pack(side="left", expand=True, fill="x",
-                                                                                   padx=2)
-        tk.Button(nav_row, text="下一段 (Next) ▶", command=self.next_segment).pack(side="right", expand=True, fill="x",
-                                                                                   padx=2)
+        tk.Button(nav_row, text="◀ 上一段 (Prev)", command=self.prev_segment).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        tk.Button(nav_row, text="下一段 (Next) ▶", command=self.next_segment).pack(
+            side="left", expand=True, fill="x", padx=2
+        )
+        tk.Button(nav_row, text="取消选中", command=self.deselect_segment).pack(
+            side="right", expand=True, fill="x", padx=2
+        )
 
         # 3. 显示与过滤模式
-        disp_frame = tk.LabelFrame(self.root, text="显示与过滤模式 (Display & Filter)", padx=8, pady=6)
+        disp_frame = tk.LabelFrame(
+            self.root, text="显示与过滤模式 (Display & Filter)", padx=8, pady=6
+        )
         disp_frame.pack(fill="x", padx=10, pady=5)
 
         self.show_all_var = tk.BooleanVar(value=True)
         self.cb_show_all = tk.Checkbutton(
-            disp_frame, text="全显示模式 (勾选: 显示全部; 取消: 仅显示当前段)",
-            variable=self.show_all_var, command=self.on_show_all_toggled, font=("Arial", 9, "bold")
+            disp_frame,
+            text="全显示模式 (勾选: 显示全部; 取消: 仅显示当前段)",
+            variable=self.show_all_var,
+            command=self.on_show_all_toggled,
+            font=("Arial", 9, "bold"),
         )
         self.cb_show_all.pack(anchor="w", pady=2)
 
         self.show_mesh_var = tk.BooleanVar(value=True)
         self.cb_mesh = tk.Checkbutton(
-            disp_frame, text="显示 3D 网格模型 (Mesh)",
-            variable=self.show_mesh_var, command=self.on_mesh_toggled
+            disp_frame,
+            text="显示 3D 网格模型 (Mesh)",
+            variable=self.show_mesh_var,
+            command=self.on_mesh_toggled,
         )
         self.cb_mesh.pack(anchor="w", pady=2)
 
@@ -632,31 +932,43 @@ class TkControlPanel:
         p_row1.pack(fill="x", pady=2)
         tk.Label(p_row1, text="绘制模式:").pack(side="left")
         self.mode_var = tk.StringVar(value="SPLINE")
-        tk.Radiobutton(p_row1, text="五次/三次 B 样条", variable=self.mode_var,
-                       value="SPLINE", command=self.on_mode_changed).pack(side="left", padx=5)
-        tk.Radiobutton(p_row1, text="直线段", variable=self.mode_var,
-                       value="LINE", command=self.on_mode_changed).pack(side="left", padx=5)
+        tk.Radiobutton(
+            p_row1,
+            text="五次/三次 B 样条",
+            variable=self.mode_var,
+            value="SPLINE",
+            command=self.on_mode_changed,
+        ).pack(side="left", padx=5)
+        tk.Radiobutton(
+            p_row1,
+            text="直线段",
+            variable=self.mode_var,
+            value="LINE",
+            command=self.on_mode_changed,
+        ).pack(side="left", padx=5)
 
         p_row2 = tk.Frame(param_frame)
         p_row2.pack(fill="x", pady=4)
         tk.Label(p_row2, text="控制点数量:").pack(side="left")
-        self.ctrl_count_var = tk.IntVar(value=10)
-        self.spin_ctrl = tk.Spinbox(p_row2, from_=4, to=30, textvariable=self.ctrl_count_var, width=6)
+        self.ctrl_count_var = tk.IntVar(value=16)
+        self.spin_ctrl = tk.Spinbox(
+            p_row2, from_=4, to=30, textvariable=self.ctrl_count_var, width=6
+        )
         self.spin_ctrl.pack(side="left", padx=5)
-        tk.Button(p_row2, text="重新均匀分布控制点", command=self.re_fit_current_segment).pack(side="right", padx=2)
+        tk.Button(
+            p_row2, text="重新均匀分布控制点", command=self.re_fit_current_segment
+        ).pack(side="right", padx=2)
 
     def populate_segments_list(self):
         labels = []
         for s in self.app.engine.segments:
             labels.append(f"#{s.segment_id} [{s.event}] ({s.region})")
         self.seg_combobox["values"] = labels
-        if labels:
-            idx = min(self.app.engine.active_segment_idx, len(labels) - 1)
-            self.seg_combobox.current(idx)
-            self.sync_segment_ui(idx)
+        self.seg_combobox.set("（未选中任何段 - 请点击选择）")
+        self.app.select_segment(None)
 
-    def sync_segment_ui(self, seg_idx: int):
-        if 0 <= seg_idx < len(self.app.engine.segments):
+    def sync_segment_ui(self, seg_idx: Optional[int]):
+        if seg_idx is not None and 0 <= seg_idx < len(self.app.engine.segments):
             seg = self.app.engine.segments[seg_idx]
             self.mode_var.set(seg.mode)
             self.ctrl_count_var.set(len(seg.control_points))
@@ -670,7 +982,12 @@ class TkControlPanel:
     def prev_segment(self):
         if not self.app.engine.segments:
             return
-        new_idx = max(0, self.app.engine.active_segment_idx - 1)
+        curr = (
+            self.app.engine.active_segment_idx
+            if self.app.engine.active_segment_idx is not None
+            else 1
+        )
+        new_idx = max(0, curr - 1)
         self.seg_combobox.current(new_idx)
         self.app.select_segment(new_idx)
         self.sync_segment_ui(new_idx)
@@ -678,10 +995,19 @@ class TkControlPanel:
     def next_segment(self):
         if not self.app.engine.segments:
             return
-        new_idx = min(len(self.app.engine.segments) - 1, self.app.engine.active_segment_idx + 1)
+        curr = (
+            self.app.engine.active_segment_idx
+            if self.app.engine.active_segment_idx is not None
+            else -1
+        )
+        new_idx = min(len(self.app.engine.segments) - 1, curr + 1)
         self.seg_combobox.current(new_idx)
         self.app.select_segment(new_idx)
         self.sync_segment_ui(new_idx)
+
+    def deselect_segment(self):
+        self.seg_combobox.set("（未选中任何段）")
+        self.app.select_segment(None)
 
     def on_show_all_toggled(self):
         show_all = self.show_all_var.get()
@@ -694,38 +1020,48 @@ class TkControlPanel:
 
     def on_mode_changed(self):
         curr_idx = self.app.engine.active_segment_idx
-        if 0 <= curr_idx < len(self.app.engine.segments):
+        if curr_idx is not None and 0 <= curr_idx < len(self.app.engine.segments):
             seg = self.app.engine.segments[curr_idx]
             seg.mode = self.mode_var.get()
-            seg.dense_xyz = self.app.engine._eval_surface_spline(seg.control_points, mode=seg.mode)
+            seg.dense_xyz = self.app.engine._eval_surface_spline(
+                seg.control_points, mode=seg.mode
+            )
             self.app.update_active_segment_visuals()
 
     def re_fit_current_segment(self):
         curr_idx = self.app.engine.active_segment_idx
-        if 0 <= curr_idx < len(self.app.engine.segments):
+        if curr_idx is not None and 0 <= curr_idx < len(self.app.engine.segments):
             seg = self.app.engine.segments[curr_idx]
             if seg.event == "SURFACE_SCAN":
                 n_ctrl = self.ctrl_count_var.get()
-                seg.control_points = self.app.engine._fit_initial_control_points(seg.dense_xyz, n_ctrl)
-                seg.dense_xyz = self.app.engine._eval_surface_spline(seg.control_points, mode=seg.mode)
-                self.app.update_all_visuals()
+                seg.control_points = self.app.engine._fit_initial_control_points(
+                    seg.dense_xyz, n_ctrl
+                )
+                seg.dense_xyz = self.app.engine._eval_surface_spline(
+                    seg.control_points, mode=seg.mode
+                )
+                self.app.update_active_segment_visuals()
 
     def open_csv_dialog(self):
         path = filedialog.askopenfilename(
             parent=self.root,
             title="选择要编辑的轨迹 CSV 文件",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
         )
         if path:
-            try:
-                segments = load_trajectory_file(Path(path))
-                self.app.engine.initialize_segments(segments)
-                self.populate_segments_list()
-                self.app.update_all_visuals()
-                self.app._reset_camera()
-                messagebox.showinfo("成功", f"成功载入并拟合 {len(segments)} 条轨迹段！", parent=self.root)
-            except Exception as e:
-                messagebox.showerror("载入失败", str(e), parent=self.root)
+            self.set_csv(Path(path))
+
+    def set_csv(self, path: Path):
+        try:
+            segments = load_trajectory_file(path)
+            self.app.engine.initialize_segments(segments)
+            self.populate_segments_list()
+            self.app.update_all_visuals()
+            self.app._reset_camera()
+            print(f"成功载入 {len(self.app.engine.segments)} 条轨迹段！")
+        except Exception as e:
+            print(f"载入 CSV 失败: {e}")
+            messagebox.showerror("载入失败", str(e), parent=self.root)
 
     def export_dialog(self):
         if not self.app.engine.segments:
@@ -736,7 +1072,7 @@ class TkControlPanel:
             parent=self.root,
             title="导出修改后的轨迹 CSV",
             defaultextension=".csv",
-            filetypes=[("CSV Files", "*.csv")]
+            filetypes=[("CSV Files", "*.csv")],
         )
         if not path:
             return
@@ -745,31 +1081,54 @@ class TkControlPanel:
         json_path = csv_path.with_suffix(".json")
         paq_path = csv_path.with_name(csv_path.stem + "_PAQ.txt")
 
-        # 1. 导出 CSV
         with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(["segment_id", "point_id", "event", "spray_on", "region", "x", "y", "z", "note"])
+            writer.writerow(
+                [
+                    "segment_id",
+                    "point_id",
+                    "event",
+                    "spray_on",
+                    "region",
+                    "x",
+                    "y",
+                    "z",
+                    "note",
+                ]
+            )
             for seg in self.app.engine.segments:
                 for pt_id, xyz in enumerate(seg.dense_xyz):
-                    writer.writerow([
-                        seg.segment_id, pt_id, seg.event, int(seg.spray_on), seg.region,
-                        f"{xyz[0]:.6f}", f"{xyz[1]:.6f}", f"{xyz[2]:.6f}",
-                        seg.note + " [Edited]"
-                    ])
+                    writer.writerow(
+                        [
+                            seg.segment_id,
+                            pt_id,
+                            seg.event,
+                            int(seg.spray_on),
+                            seg.region,
+                            f"{xyz[0]:.6f}",
+                            f"{xyz[1]:.6f}",
+                            f"{xyz[2]:.6f}",
+                            seg.note + " [Edited]",
+                        ]
+                    )
 
-        # 2. 导出 JSON
         control_payload = []
         for seg in self.app.engine.segments:
-            control_payload.append({
-                "segment_id": seg.segment_id,
-                "event": seg.event,
-                "region": seg.region,
-                "points": seg.control_points.tolist(),
-            })
-        json_path.write_text(json.dumps({"control_points": control_payload}, indent=2, ensure_ascii=False),
-                             encoding="utf-8")
+            control_payload.append(
+                {
+                    "segment_id": seg.segment_id,
+                    "event": seg.event,
+                    "region": seg.region,
+                    "points": seg.control_points.tolist(),
+                }
+            )
+        json_path.write_text(
+            json.dumps(
+                {"control_points": control_payload}, indent=2, ensure_ascii=False
+            ),
+            encoding="utf-8",
+        )
 
-        # 3. 导出 PAQ 文件
         all_pts, is_spray = [], []
         for seg in self.app.engine.segments:
             for xyz in seg.dense_xyz:
@@ -778,7 +1137,9 @@ class TkControlPanel:
 
         if all_pts:
             pts_arr = np.asarray(all_pts, dtype=float)
-            closest, _, face_ids = trimesh.proximity.closest_point(self.app.mesh, pts_arr)
+            closest, _, face_ids = trimesh.proximity.closest_point(
+                self.app.mesh, pts_arr
+            )
             normals = np.asarray(self.app.mesh.face_normals, dtype=float)[face_ids]
             inward_normals = -normals
 
@@ -800,7 +1161,9 @@ class TkControlPanel:
                 cum_d = 0.0
                 for i in range(len(export_pts)):
                     if i > 0:
-                        cum_d += float(np.linalg.norm(export_pts[i] - export_pts[i - 1]))
+                        cum_d += float(
+                            np.linalg.norm(export_pts[i] - export_pts[i - 1])
+                        )
                     quat = _orientation_quaternion(tangents[i], inward_normals[i])
                     f.write(
                         f"{export_pts[i, 0]:.3f} {export_pts[i, 1]:.3f} {export_pts[i, 2]:.3f} "
@@ -808,8 +1171,11 @@ class TkControlPanel:
                         f"300.000 0.000 {cum_d:.6f} 0 0.000\n"
                     )
 
-        messagebox.showinfo("完成", f"已成功导出所有格式轨迹：\nCSV: {csv_path}\nJSON: {json_path}\nPAQ: {paq_path}",
-                            parent=self.root)
+        messagebox.showinfo(
+            "完成",
+            f"已成功导出所有格式轨迹：\nCSV: {csv_path}\nJSON: {json_path}\nPAQ: {paq_path}",
+            parent=self.root,
+        )
 
 
 def _quaternion_from_matrix(matrix: np.ndarray) -> np.ndarray:
@@ -846,7 +1212,9 @@ def _quaternion_from_matrix(matrix: np.ndarray) -> np.ndarray:
     return quat / max(float(np.linalg.norm(quat)), EPS)
 
 
-def _orientation_quaternion(tangent: np.ndarray, inward_normal: np.ndarray) -> np.ndarray:
+def _orientation_quaternion(
+    tangent: np.ndarray, inward_normal: np.ndarray
+) -> np.ndarray:
     y_axis = np.asarray(tangent, dtype=float)
     y_norm = np.linalg.norm(y_axis)
     y_axis = y_axis / y_norm if y_norm > EPS else np.array([0.0, 1.0, 0.0])
@@ -881,93 +1249,62 @@ def tick_tkinter(panel: TkControlPanel):
         pass
 
 
-# =========================================================================
-# 六、 启动与交互流程
-# =========================================================================
-
-def _select_mesh_file() -> Optional[str]:
-    root = tk.Tk()
-    root.withdraw()
-    path = filedialog.askopenfilename(
-        title="【第 1 步】请选择工件 STL/OBJ 三维模型",
-        filetypes=[("3D Mesh files", "*.stl *.obj *.ply *.off"), ("All files", "*.*")]
-    )
-    root.destroy()
-    return path if path else None
-
-
-def _select_csv_file() -> Optional[str]:
-    root = tk.Tk()
-    root.withdraw()
-    path = filedialog.askopenfilename(
-        title="【第 2 步】请选择要导入编辑的轨迹 CSV 文件 (*_optcuts_trajectory.csv)",
-        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-    )
-    root.destroy()
-    return path if path else None
-
-
 def main():
     parser = argparse.ArgumentParser(description="OptCuts 3D Surface Trajectory Editor")
     parser.add_argument("mesh", nargs="?", default="", help="Input STL/OBJ mesh file.")
     parser.add_argument("--csv", default="", help="Input trajectory CSV file.")
     args = parser.parse_args()
 
-    # 初始化单个全局 Tk 实例
-    tk_root = tk.Tk()
-    tk_root.withdraw()
-
-    # 1. 弹出第 1 步：选择 STL 模型
+    # 1. 独立置顶对话框选择 STL 文件
     mesh_path = args.mesh
     if not mesh_path:
+        temp_tk = tk.Tk()
+        temp_tk.withdraw()
+        temp_tk.attributes("-topmost", True)
+        temp_tk.update()
         mesh_path = filedialog.askopenfilename(
-            parent=tk_root,
+            parent=temp_tk,
             title="【第 1 步】请选择工件 STL/OBJ 三维模型",
-            filetypes=[("3D Mesh files", "*.stl *.obj *.ply *.off"), ("All files", "*.*")]
+            filetypes=[
+                ("3D Mesh files", "*.stl *.obj *.ply *.off"),
+                ("All files", "*.*"),
+            ],
         )
+        temp_tk.destroy()
 
     if not mesh_path:
         print("未选择模型，程序退出。")
-        tk_root.destroy()
         return
 
     print(f"正在加载工件模型: {mesh_path}")
     mesh_raw = trimesh.load(mesh_path, process=False)
     if isinstance(mesh_raw, trimesh.Scene):
-        geoms = [g for g in mesh_raw.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        geoms = [
+            g for g in mesh_raw.geometry.values() if isinstance(g, trimesh.Trimesh)
+        ]
         mesh = trimesh.util.concatenate(geoms)
     else:
         mesh = mesh_raw
     mesh.remove_unreferenced_vertices()
 
-    # 2. 弹出第 2 步：选择轨迹 CSV 文件
-    csv_path = args.csv
-    if not csv_path:
-        csv_path = filedialog.askopenfilename(
-            parent=tk_root,
-            title="【第 2 步】请选择要导入编辑的轨迹 CSV 文件 (*_optcuts_trajectory.csv)",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-        )
+    # 2. 检查是否有同名 CSV 文件
+    stl_path = Path(mesh_path)
+    auto_csv = stl_path.with_name(stl_path.stem + "_optcuts_trajectory.csv")
 
-    # 3. 启动应用程序与控制器
+    # 3. 启动 GUI
+    tk_root = tk.Tk()
     app = SurfaceCurveApp(mesh)
     panel = TkControlPanel(app, tk_root)
     app.panel = panel
 
-    # 4. 自动载入轨迹并生成分段样条与控制点
-    if csv_path:
-        try:
-            segments = load_trajectory_file(Path(csv_path))
-            app.engine.initialize_segments(segments)
-            panel.populate_segments_list()
-            app.update_all_visuals()
-            app._reset_camera()
-            print(f"成功载入 {len(segments)} 条轨迹段！")
-        except Exception as e:
-            print(f"载入 CSV 失败: {e}")
-            messagebox.showerror("载入失败", str(e), parent=tk_root)
+    # 4. 自动载入同名 CSV 或通过参数载入
+    target_csv = (
+        Path(args.csv) if args.csv else (auto_csv if auto_csv.exists() else None)
+    )
+    if target_csv and target_csv.exists():
+        print(f"自动载入轨迹文件: {target_csv}")
+        panel.set_csv(target_csv)
 
-    # 5. 注册定时器与启动渲染循环
     app.interactor.AddObserver("TimerEvent", lambda obj, ev: tick_tkinter(panel))
     app.interactor.CreateRepeatingTimer(10)
 

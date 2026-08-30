@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import messagebox
 from dataclasses import dataclass
 from pathlib import Path
+import cutopt_cache
 from typing import Iterable, List, Optional, Sequence, Tuple
 import heapq
 import numpy as np
@@ -693,8 +694,9 @@ def _select_mesh_file() -> str:
     root.withdraw()
     root.update()
     path = filedialog.askopenfilename(
-        title="Select mesh for OptCuts",
+        title="Select mesh or OptCuts cache",
         filetypes=[
+            ("OptCuts cache", "*.json"),
             ("Mesh files", "*.stl *.obj *.ply *.off"),
             ("OBJ files", "*.obj"),
             ("STL files", "*.stl"),
@@ -4504,7 +4506,7 @@ def vtk_actor(polydata: vtk.vtkPolyData, color: tuple[float, float, float], opac
 
     # 【视觉增强】：将线段渲染为实体细管，能大幅减少共面闪烁，且视觉效果更高级
     actor.GetProperty().SetLineWidth(width)
-    actor.GetProperty().SetRenderLinesAsTubes(True)
+    actor.GetProperty().SetRenderLinesAsTubes(False)
 
     if wireframe:
         actor.GetProperty().SetRepresentationToWireframe()
@@ -4744,6 +4746,7 @@ class InteractiveVisualizer:
         self.window = vtk.vtkRenderWindow()
         self.window.SetWindowName("OptCuts trajectory - VTK/OpenGL (fitcurveplan)")
         self.window.SetSize(1600, 900)
+        self.window.SetMultiSamples(0)
         # 【新增】：1. 设置渲染窗口支持 2 个层级 (Layer 0 和 Layer 1)
         self.window.SetNumberOfLayers(2)
 
@@ -4802,6 +4805,7 @@ class InteractiveVisualizer:
 
         self.interactor = vtk.vtkRenderWindowInteractor()
         self.interactor.SetRenderWindow(self.window)
+        self.interactor.SetDesiredUpdateRate(30.0)
         self.interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
 
     def apply_visibility(self):
@@ -5422,17 +5426,31 @@ def main() -> None:
     selected = args.mesh or _select_mesh_file()
     if not selected:
         return
-    mesh = _load_mesh(selected)
-    optcuts_mesh, precut_seam = _precut_two_boundaries(mesh)
-    if precut_seam is None:
-        raise ValueError(
-            "Seam-aware trajectory planning requires the original burner mesh to have exactly two openings."
-        )
-    official_input = _prepare_official_input(optcuts_mesh)
-    _save_precut_seam(official_input, precut_seam)
-    result_obj = _run_official_optcuts(official_input)
-    data = _read_obj_uv_data(result_obj)
-    optimized_cut_edges = _read_obj_cut_edges(result_obj)
+    selected_path = Path(selected).resolve()
+    if selected_path.suffix.lower() == ".json":
+        model_path, unfolded_obj = cutopt_cache.load(selected_path)
+        mesh = _load_mesh(str(model_path))
+        optcuts_mesh, precut_seam = _precut_two_boundaries(mesh)
+        if precut_seam is None:
+            raise ValueError("Cached source model must have exactly two openings.")
+        result_obj = unfolded_obj
+        data = _read_obj_uv_data(result_obj)
+        optimized_cut_edges = _read_obj_cut_edges(result_obj)
+        selected_path = model_path
+        print(f"Loaded OptCuts cache: {selected_path}")
+    else:
+        mesh = _load_mesh(str(selected_path))
+        optcuts_mesh, precut_seam = _precut_two_boundaries(mesh)
+        if precut_seam is None:
+            raise ValueError(
+                "Seam-aware trajectory planning requires the original burner mesh to have exactly two openings."
+            )
+        official_input = _prepare_official_input(optcuts_mesh)
+        _save_precut_seam(official_input, precut_seam)
+        result_obj = _run_official_optcuts(official_input)
+        data = _read_obj_uv_data(result_obj)
+        optimized_cut_edges = _read_obj_cut_edges(result_obj)
+        cutopt_cache.save(selected_path, result_obj)
     if len(precut_seam.edges) and len(optimized_cut_edges):
         cut_edges = np.vstack([precut_seam.edges, optimized_cut_edges])
     elif len(precut_seam.edges):
