@@ -1728,15 +1728,27 @@ def split_center_intrusions_3d(
     extension_tol: float = 0.0,
 ) -> list[TrajectorySegment]:
     """在真实 3D 空间进行精准求交并切分为 CENTER(黄色) 与 CENTER_INTRUDED(红色)。"""
-    center_tracks = [s for s in trajectory if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "CENTER"]
-    boundary_tracks = [s for s in trajectory if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") in ("LOWER", "UPPER")]
+    center_tracks = [
+        s
+        for s in trajectory
+        if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "CENTER"
+    ]
+    boundary_tracks = [
+        s
+        for s in trajectory
+        if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") in ("LOWER", "UPPER")
+    ]
 
     if not center_tracks or not boundary_tracks:
         return trajectory
 
     # 1. 采用 shujutu 策略：找到离 CENTER 最近的最外侧 LOWER / UPPER 轨迹
     def extract_outer_loop(region_name: str) -> np.ndarray | None:
-        cand = [s for s in boundary_tracks if getattr(s, "region", "") == region_name and len(s.xyz) >= 2]
+        cand = [
+            s
+            for s in boundary_tracks
+            if getattr(s, "region", "") == region_name and len(s.xyz) >= 2
+        ]
         if not cand:
             return None
         best = cand[-1] if region_name == "LOWER" else cand[0]
@@ -1745,22 +1757,29 @@ def split_center_intrusions_3d(
 
     lower_loop = extract_outer_loop("LOWER")
     upper_loop = extract_outer_loop("UPPER")
-    # Symmetric layout: only the outermost LOWER and UPPER tracks are the
-    # crossing boundaries; inner tracks are CENTER neighbours, not boundaries.
+
     all_boundary_loops = [loop for loop in (lower_loop, upper_loop) if loop is not None]
     boundary_segment_records = [
         (a, b, loop, "LOWER" if loop is lower_loop else "UPPER")
         for loop in all_boundary_loops
         for a, b in zip(loop[:-1], loop[1:])
     ]
-    boundary_segment_tree = cKDTree(np.asarray([
-        0.5 * (a + b) for a, b, _, _ in boundary_segment_records
-    ], dtype=float)) if boundary_segment_records else None
-    boundary_segment_half_lengths = np.asarray([
-        0.5 * float(np.linalg.norm(b - a))
-        for a, b, _, _ in boundary_segment_records
-    ], dtype=float)
-    boundary_segment_max_half = float(np.max(boundary_segment_half_lengths, initial=0.0))
+    boundary_segment_tree = (
+        cKDTree(
+            np.asarray(
+                [0.5 * (a + b) for a, b, _, _ in boundary_segment_records], dtype=float
+            )
+        )
+        if boundary_segment_records
+        else None
+    )
+    boundary_segment_half_lengths = np.asarray(
+        [0.5 * float(np.linalg.norm(b - a)) for a, b, _, _ in boundary_segment_records],
+        dtype=float,
+    )
+    boundary_segment_max_half = float(
+        np.max(boundary_segment_half_lengths, initial=0.0)
+    )
     if lower_loop is None and upper_loop is None:
         return trajectory
 
@@ -1772,9 +1791,11 @@ def split_center_intrusions_3d(
         for a, b in zip(loop[:-1], loop[1:]):
             edge = b - a
             denom = float(np.dot(edge, edge))
-            ratio = 0.0 if denom <= EPS else float(np.clip(
-                np.dot(point - a, edge) / denom, 0.0, 1.0
-            ))
+            ratio = (
+                0.0
+                if denom <= EPS
+                else float(np.clip(np.dot(point - a, edge) / denom, 0.0, 1.0))
+            )
             best = min(best, float(np.linalg.norm(point - (a + ratio * edge))))
         return best
 
@@ -1782,17 +1803,16 @@ def split_center_intrusions_3d(
         loop = lower_loop if region == "LOWER" else upper_loop
         if loop is None or len(points) == 0:
             return False
-        # Candidate filtering must use the same definition as a real hit:
-        # KD-tree pruning followed by exact segment distance and opposite-side
-        # testing.  Distance alone is reserved for post-hit extension.
         region_records = [
             record for record in boundary_segment_records if record[3] == region
         ]
         if not region_records:
             return False
-        region_tree = cKDTree(np.asarray([
-            0.5 * (q1 + q2) for q1, q2, _, _ in region_records
-        ], dtype=float))
+        region_tree = cKDTree(
+            np.asarray(
+                [0.5 * (q1 + q2) for q1, q2, _, _ in region_records], dtype=float
+            )
+        )
         max_half = max(
             (0.5 * float(np.linalg.norm(q2 - q1)) for q1, q2, _, _ in region_records),
             default=0.0,
@@ -1805,48 +1825,32 @@ def split_center_intrusions_3d(
             ):
                 q1, q2, candidate_loop, _ = region_records[candidate]
                 distance, u, v = _find_3d_segment_closest_point(p1, p2, q1, q2)
-                if not (distance <= intersection_tol
-                        and 1.0e-6 < u < 1.0 - 1.0e-6
-                        and 1.0e-6 < v < 1.0 - 1.0e-6):
+                if not (
+                    distance <= intersection_tol
+                    and 1.0e-6 < u < 1.0 - 1.0e-6
+                    and 1.0e-6 < v < 1.0 - 1.0e-6
+                ):
                     continue
-                if segment_side(p1, q1, q2, candidate_loop) * segment_side(
-                    p2, q1, q2, candidate_loop
-                ) < 0.0:
+                if (
+                    segment_side(p1, q1, q2, candidate_loop)
+                    * segment_side(p2, q1, q2, candidate_loop)
+                    < 0.0
+                ):
                     return True
         return False
 
-    def signed_side(point: np.ndarray, loop: np.ndarray) -> float:
-        """Return signed distance in the local boundary tangent plane."""
-        tree = cKDTree(loop)
-        _, near_idx = tree.query(point)
-        boundary_point = loop[int(near_idx)]
-        near_idx = int(near_idx)
-        # LOWER/UPPER are open scan polylines.  Do not wrap their endpoints
-        # around to the opposite endpoint when estimating the tangent.
-        if near_idx == 0:
-            tangent = loop[1] - loop[0]
-        elif near_idx == len(loop) - 1:
-            tangent = loop[-1] - loop[-2]
-        else:
-            tangent = loop[near_idx + 1] - loop[near_idx - 1]
-        tangent_norm = float(np.linalg.norm(tangent))
-        if tangent_norm <= 1e-9:
-            return 0.0
-        tangent /= tangent_norm
-        _, _, face_id = trimesh.proximity.closest_point(mesh, [boundary_point])
-        normal = mesh.face_normals[int(face_id[0])]
-        inward = np.cross(normal, tangent)
-        inward_norm = float(np.linalg.norm(inward))
-        if inward_norm <= 1e-9:
-            return 0.0
-        inward /= inward_norm
-        loop_center = np.mean(loop, axis=0)
-        if np.dot(inward, loop_center - boundary_point) < 0.0:
-            inward = -inward
-        return float(np.dot(point - boundary_point, inward))
+    intersection_cache: dict[tuple[int, str], bool] = {}
+    boundary_distance_cache: dict[tuple[str, str], tuple[int, np.ndarray, float]] = {}
 
-    def segment_side(point: np.ndarray, q1: np.ndarray, q2: np.ndarray,
-                     loop: np.ndarray) -> float:
+    def cached_intersects(track_index: int, points: np.ndarray, region: str) -> bool:
+        key = (int(track_index), region)
+        if key not in intersection_cache:
+            intersection_cache[key] = bool(likely_intersects(points, region))
+        return intersection_cache[key]
+
+    def segment_side(
+        point: np.ndarray, q1: np.ndarray, q2: np.ndarray, loop: np.ndarray
+    ) -> float:
         """Signed side relative to the actual boundary segment being tested."""
         tangent = np.asarray(q2, dtype=float) - np.asarray(q1, dtype=float)
         norm = float(np.linalg.norm(tangent))
@@ -1866,56 +1870,64 @@ def split_center_intrusions_3d(
         return float(np.dot(np.asarray(point, dtype=float) - midpoint, side))
 
     candidate_state: dict[int, bool] = {}
-    # The LOWER and UPPER boundaries form a U-shaped pair.  Both boundaries
-    # are adjacent to both ends of CENTER, so inspect symmetric pairs
-    # (0,n-1), (1,n-2), ... rather than assigning one boundary to one end.
+    candidate_regions: dict[int, set[str]] = {}
+    intrusion_groups: dict[tuple[str, str], dict[str, object]] = {}
+    track_region_group: dict[tuple[int, str], tuple[str, str]] = {}
+
     center_count = len(center_tracks)
-    left_active = True
-    right_active = True
-    for depth in range((center_count + 1) // 2):
-        left_index = depth
-        right_index = center_count - 1 - depth
-        layer_hit = False
 
-        if left_active:
-            points = np.asarray(center_tracks[left_index].xyz, dtype=float)
-            left_hit = len(points) >= 2 and any(
-                loop is not None and likely_intersects(points, region)
-                for region, loop in (("LOWER", lower_loop), ("UPPER", upper_loop))
-            )
-            if left_hit:
-                candidate_state[left_index] = True
-                layer_hit = True
+    def build_intrusion_group(side_name: str, boundary_region: str) -> None:
+        loop = lower_loop if boundary_region == "LOWER" else upper_loop
+        if loop is None:
+            return
+
+        if side_name == "SMALL":
+            scan_indices = range(center_count)
+        elif side_name == "LARGE":
+            scan_indices = range(center_count - 1, -1, -1)
+        else:
+            raise ValueError(f"Unknown center side: {side_name}")
+
+        intruded_indices: list[int] = []
+        baseline_index: int | None = None
+        for idx in scan_indices:
+            points = np.asarray(center_tracks[idx].xyz, dtype=float)
+            hit = len(points) >= 2 and cached_intersects(idx, points, boundary_region)
+            if hit:
+                intruded_indices.append(idx)
             else:
-                left_active = False
+                baseline_index = idx
+                break
 
-        if right_active and right_index != left_index:
-            points = np.asarray(center_tracks[right_index].xyz, dtype=float)
-            right_hit = len(points) >= 2 and any(
-                loop is not None and likely_intersects(points, region)
-                for region, loop in (("LOWER", lower_loop), ("UPPER", upper_loop))
-            )
-            if right_hit:
-                candidate_state[right_index] = True
-                layer_hit = True
-            else:
-                right_active = False
+        if not intruded_indices or baseline_index is None:
+            return
 
-        # Once both ends have stopped, all deeper CENTER tracks are skipped.
-        if not layer_hit and not left_active and not right_active:
-            break
+        group_key = (side_name, boundary_region)
+        intrusion_groups[group_key] = {
+            "indices": intruded_indices,
+            "baseline_index": baseline_index,
+        }
+        for idx in intruded_indices:
+            candidate_state[idx] = True
+            candidate_regions.setdefault(idx, set()).add(boundary_region)
+            track_region_group[(idx, boundary_region)] = group_key
+
+    for boundary_region in ("LOWER", "UPPER"):
+        build_intrusion_group("SMALL", boundary_region)
+        build_intrusion_group("LARGE", boundary_region)
 
     new_trajectory: list[TrajectorySegment] = []
     debug_intersections: list[np.ndarray] = []
 
-    # 2. 遍历 CENTER 轨迹求交
+    # 2. 遍历 CENTER 轨迹求交与偏移
     for seg in trajectory:
         if seg.kind != "SURFACE_SCAN" or getattr(seg, "region", "") != "CENTER":
             new_trajectory.append(seg)
             continue
 
-        track_index = next((i for i, candidate in enumerate(center_tracks)
-                            if candidate is seg), None)
+        track_index = next(
+            (i for i, candidate in enumerate(center_tracks) if candidate is seg), None
+        )
         if track_index not in candidate_state:
             new_trajectory.append(seg)
             continue
@@ -1925,10 +1937,6 @@ def split_center_intrusions_3d(
             new_trajectory.append(seg)
             continue
 
-        # The planning spacing can be several millimetres, while two real
-        # crossings may be much closer.  Densify each CENTER polyline before
-        # candidate search so a short enter/leave interval cannot be hidden
-        # inside one coarse sample segment.
         dense_step = max(min(float(intersection_tol), 1.0), 0.25)
         dense_points = [xyz[0]]
         for start, end in zip(xyz[:-1], xyz[1:]):
@@ -1939,10 +1947,6 @@ def split_center_intrusions_3d(
         xyz = np.asarray(dense_points, dtype=float)
 
         refined_pts = [xyz[0]]
-        # Keep the locations of the actual boundary contacts separately from
-        # the distance-based samples used below.  The interval between the
-        # first and last contact is always intrusive, even when its middle is
-        # farther than intersection_tol from either boundary.
         intersection_points = []
         intersection_vertex_indices = []
         for i in range(len(xyz) - 1):
@@ -1953,8 +1957,14 @@ def split_center_intrusions_3d(
             if boundary_segment_tree is not None:
                 active_midpoint = 0.5 * (p1 + p2)
                 active_half = 0.5 * float(np.linalg.norm(p2 - p1))
-                query_radius = active_half + boundary_segment_max_half + intersection_tol
-                local_candidates.update(boundary_segment_tree.query_ball_point(active_midpoint, r=query_radius))
+                query_radius = (
+                    active_half + boundary_segment_max_half + intersection_tol
+                )
+                local_candidates.update(
+                    boundary_segment_tree.query_ball_point(
+                        active_midpoint, r=query_radius
+                    )
+                )
             for seg_index in local_candidates:
                 q1, q2, loop, boundary_region = boundary_segment_records[seg_index]
                 dist, u, v = _find_3d_segment_closest_point(p1, p2, q1, q2)
@@ -1964,12 +1974,8 @@ def split_center_intrusions_3d(
                     and 1e-4 < v < (1.0 - 1e-4)
                 ):
                     continue
-                # Proximity alone is insufficient: require crossing of the
-                # local plane associated with the actual boundary segment.
                 side_a = segment_side(p1, q1, q2, loop)
                 side_b = segment_side(p2, q1, q2, loop)
-                # Strict sign change is required; touching/tangent contact is
-                # not an enter/leave crossing.
                 if side_a * side_b >= 0.0:
                     continue
                 point = p1 + u * (p2 - p1)
@@ -1982,34 +1988,27 @@ def split_center_intrusions_3d(
                 intersection_vertex_indices.append(len(refined_pts) - 1)
             refined_pts.append(p2)
 
-        # Preserve the exact 3D closest-point intersections.  Re-projecting
-        # them to the mesh can move a valid crossing away from its boundary.
         refined_pts_arr = np.asarray(refined_pts, dtype=float)
         debug_intersections.extend(point for point, _ in intersection_points)
 
         # 3. 判定微段中点是否在封闭多边形内部
-        # Classify by the requested distance threshold: a segment within
-        # 0.1*d of either boundary is rendered as intrusive.
         seg_labels = np.zeros(len(refined_pts_arr) - 1, dtype=int)
-        # The insertion indices are exact; nearest-neighbour remapping can
-        # collapse two physically close crossings onto one vertex.
-        # Keep only the first and last crossing for each boundary region.
-        # LOWER and UPPER are independent; never pair crossings across them.
         selected_contacts = []
         for boundary_region in ("LOWER", "UPPER"):
             region_hits = [
                 (index, point)
                 for index, (point, region) in zip(
                     intersection_vertex_indices, intersection_points
-                ) if region == boundary_region
+                )
+                if region == boundary_region
             ]
             if len(region_hits) >= 2:
-                selected_contacts.append((region_hits[0][0], region_hits[-1][0], boundary_region))
+                selected_contacts.append(
+                    (region_hits[0][0], region_hits[-1][0], boundary_region)
+                )
 
-        # Extend each boundary's first/last crossing while the CENTER segment
-        # remains within 0.2d of that same boundary.  This threshold expands
-        # an already-established intrusion; it never creates a crossing.
         extension_tol = max(float(extension_tol), 0.0)
+
         def near_boundary_segment(index: int, loop: np.ndarray | None) -> bool:
             if loop is None or index < 0 or index >= len(refined_pts_arr) - 1:
                 return False
@@ -2024,25 +2023,240 @@ def split_center_intrusions_3d(
             loop = lower_loop if boundary_region == "LOWER" else upper_loop
             while first > 0 and near_boundary_segment(first - 1, loop):
                 first -= 1
-            while second < len(refined_pts_arr) - 1 and near_boundary_segment(second, loop):
+            while second < len(refined_pts_arr) - 1 and near_boundary_segment(
+                second, loop
+            ):
                 second += 1
-            intervals.append((first, second))
+            intervals.append((first, second, boundary_region))
 
-        for pair_id, (first, second) in enumerate(sorted(intervals), start=1):
+        for pair_id, (first, second, _) in enumerate(sorted(intervals), start=1):
             if second > first:
                 seg_labels[first:second] = pair_id
 
-        # 4. 聚合并拆分生成子段
+        # =====================================================================
+        # 优化后半段：高速等分外推（Shift）+ 局部曲面贴合 + 快速拆分缝合
+        # =====================================================================
+        original_refined_pts_arr = refined_pts_arr.copy()
+        active_regions = candidate_regions.get(track_index, set())
+
+        if active_regions:
+
+            def _resample_reference_fast(
+                ref_pts: np.ndarray, target_params: np.ndarray
+            ) -> np.ndarray:
+                target_params = np.asarray(target_params, dtype=float)
+                if len(ref_pts) < 2:
+                    return np.repeat(ref_pts[:1], len(target_params), axis=0)
+                dists = np.linalg.norm(np.diff(ref_pts, axis=0), axis=1)
+                cum = np.r_[0.0, np.cumsum(dists)]
+                total = float(cum[-1])
+                if total <= EPS:
+                    return np.repeat(ref_pts[:1], len(target_params), axis=0)
+                ref_params = cum / total
+                keep = np.r_[True, np.diff(ref_params) > 1.0e-12]
+                ref_params = ref_params[keep]
+                ref_pts = ref_pts[keep]
+                s_targets = np.clip(target_params, 0.0, 1.0)
+                out = np.empty((len(s_targets), 3), dtype=float)
+                for axis in range(3):
+                    out[:, axis] = np.interp(s_targets, ref_params, ref_pts[:, axis])
+                return out
+
+            def _normalized_arc_params(points: np.ndarray) -> np.ndarray:
+                if len(points) == 0:
+                    return np.zeros(0, dtype=float)
+                if len(points) == 1:
+                    return np.zeros(1, dtype=float)
+                lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+                cum = np.r_[0.0, np.cumsum(lengths)]
+                total = float(cum[-1])
+                if total <= EPS:
+                    return np.linspace(0.0, 1.0, len(points))
+                return cum / total
+
+            def _orient_reference_to(
+                ref_pts: np.ndarray, target_pts: np.ndarray
+            ) -> np.ndarray:
+                ref_pts = np.asarray(ref_pts, dtype=float)
+                target_pts = np.asarray(target_pts, dtype=float)
+                if len(ref_pts) < 2 or len(target_pts) < 2:
+                    return ref_pts
+                forward = float(
+                    np.linalg.norm(ref_pts[0] - target_pts[0])
+                    + np.linalg.norm(ref_pts[-1] - target_pts[-1])
+                )
+                reversed_cost = float(
+                    np.linalg.norm(ref_pts[-1] - target_pts[0])
+                    + np.linalg.norm(ref_pts[0] - target_pts[-1])
+                )
+                return ref_pts[::-1] if reversed_cost < forward else ref_pts
+
+            def _global_polyline_min_distance(
+                first_pts: np.ndarray, second_pts: np.ndarray
+            ) -> float:
+                if len(first_pts) < 2 or len(second_pts) < 2:
+                    return float("inf")
+                best = float("inf")
+                for p1, p2 in zip(first_pts[:-1], first_pts[1:]):
+                    for q1, q2 in zip(second_pts[:-1], second_pts[1:]):
+                        dist, _, _ = _find_3d_segment_closest_point(p1, p2, q1, q2)
+                        best = min(best, float(dist))
+                return best
+
+            shifted = refined_pts_arr.copy()
+            current_params = _normalized_arc_params(original_refined_pts_arr)
+
+            for boundary_region in sorted(active_regions):
+                loop = lower_loop if boundary_region == "LOWER" else upper_loop
+                if loop is None:
+                    continue
+
+                group_key = track_region_group.get((track_index, boundary_region))
+                if group_key is None:
+                    continue
+                group = intrusion_groups.get(group_key)
+                if group is None:
+                    continue
+
+                side_name = group_key[0]
+                region_intruded_indices = list(group["indices"])
+                baseline_index = int(group["baseline_index"])
+
+                if not region_intruded_indices:
+                    continue
+
+                dist_cache_key = (boundary_region, side_name)
+                if dist_cache_key not in boundary_distance_cache:
+                    baseline_pts = np.asarray(
+                        center_tracks[baseline_index].xyz, dtype=float
+                    )
+                    d1_val = _global_polyline_min_distance(baseline_pts, loop)
+                    boundary_distance_cache[dist_cache_key] = (
+                        baseline_index,
+                        baseline_pts,
+                        d1_val,
+                    )
+
+                _, baseline, d1 = boundary_distance_cache[dist_cache_key]
+                current = original_refined_pts_arr
+                if len(baseline) < 2 or len(current) < 2:
+                    continue
+                if not np.isfinite(d1) or d1 <= EPS:
+                    continue
+
+                baseline = _orient_reference_to(baseline, current)
+                loop_for_direction = _orient_reference_to(loop, baseline)
+                baseline_on_current = _resample_reference_fast(baseline, current_params)
+                boundary_on_current = _resample_reference_fast(
+                    loop_for_direction, current_params
+                )
+                n_intruded = len(region_intruded_indices)
+
+                try:
+                    position = region_intruded_indices.index(track_index)
+                except ValueError:
+                    continue
+
+                delta_d = d1 / (n_intruded + 1)
+                offset = float(n_intruded - position) * delta_d
+
+                region_intervals = [
+                    (first, second)
+                    for first, second, r_name in intervals
+                    if r_name == boundary_region
+                ]
+
+                region_mask = np.zeros(len(refined_pts_arr), dtype=bool)
+                for first, second in region_intervals:
+                    region_mask[first : second + 1] = True
+
+                direction = boundary_on_current - baseline_on_current
+                direction_norm = np.linalg.norm(direction, axis=1)
+                valid = region_mask & (direction_norm > EPS)
+
+                if np.any(valid):
+                    push_dirs = direction[valid] / direction_norm[valid, None]
+                    shifted[valid] = baseline_on_current[valid] + push_dirs * offset
+
+                for first, second in region_intervals:
+                    if second <= first:
+                        continue
+                    midpoint = (first + second) // 2
+                    entry_range = np.arange(first, midpoint + 1)
+                    exit_range = np.arange(midpoint, second + 1)
+
+                    if len(entry_range) > 0:
+                        entry_idx = int(
+                            entry_range[
+                                np.argmin(
+                                    np.linalg.norm(
+                                        shifted[entry_range]
+                                        - original_refined_pts_arr[first],
+                                        axis=1,
+                                    )
+                                )
+                            ]
+                        )
+                        seg_labels[first:entry_idx] = 0
+
+                    if len(exit_range) > 0:
+                        exit_idx = int(
+                            exit_range[
+                                np.argmin(
+                                    np.linalg.norm(
+                                        shifted[exit_range]
+                                        - original_refined_pts_arr[second],
+                                        axis=1,
+                                    )
+                                )
+                            ]
+                        )
+                        seg_labels[exit_idx:second] = 0
+
+            moved_mask = (
+                np.linalg.norm(shifted - original_refined_pts_arr, axis=1) > 1e-4
+            )
+            if np.any(moved_mask):
+                try:
+                    proj_pts, _, _ = trimesh.proximity.closest_point(
+                        mesh, shifted[moved_mask]
+                    )
+                    shifted[moved_mask] = proj_pts
+                except Exception:
+                    pass
+
+            refined_pts_arr = shifted
+
+        # 4. 快速分段与 OVERTRAVEL 过渡线直接挂载 (单循环生成)
         curr_label = int(seg_labels[0])
         sub_pts = [refined_pts_arr[0]]
+        sub_start_index = 0
 
         for i in range(len(seg_labels)):
             sub_pts.append(refined_pts_arr[i + 1])
-            if i == len(seg_labels) - 1 or seg_labels[i + 1] != curr_label:
+            is_last_step = i == len(seg_labels) - 1
+
+            if is_last_step or seg_labels[i + 1] != curr_label:
                 sub_arr = np.asarray(sub_pts, dtype=float)
                 is_intruded = curr_label > 0
                 region_tag = "CENTER_INTRUDED" if is_intruded else "CENTER"
                 note_tag = seg.note + (" [INTRUDED]" if is_intruded else " [SAFE]")
+
+                if is_intruded:
+                    start_orig = original_refined_pts_arr[sub_start_index]
+                    start_shift = refined_pts_arr[sub_start_index]
+                    if np.linalg.norm(start_orig - start_shift) > 1e-4:
+                        new_trajectory.append(
+                            TrajectorySegment(
+                                kind="OVERTRAVEL",
+                                uv=np.full((2, 2), np.nan),
+                                xyz=np.vstack([start_orig, start_shift]),
+                                spray_on=False,
+                                note="[INTRUSION_ENTRY_CONNECT]",
+                                region="INTRUSION_CONNECT",
+                                phases=np.zeros(2, dtype=int),
+                            )
+                        )
 
                 new_trajectory.append(
                     TrajectorySegment(
@@ -2056,21 +2270,40 @@ def split_center_intrusions_3d(
                     )
                 )
 
-                if i < len(seg_labels) - 1:
+                if is_intruded:
+                    end_orig = original_refined_pts_arr[i + 1]
+                    end_shift = refined_pts_arr[i + 1]
+                    if np.linalg.norm(end_orig - end_shift) > 1e-4:
+                        new_trajectory.append(
+                            TrajectorySegment(
+                                kind="OVERTRAVEL",
+                                uv=np.full((2, 2), np.nan),
+                                xyz=np.vstack([end_shift, end_orig]),
+                                spray_on=False,
+                                note="[INTRUSION_EXIT_CONNECT]",
+                                region="INTRUSION_CONNECT",
+                                phases=np.zeros(2, dtype=int),
+                            )
+                        )
+
+                if not is_last_step:
                     curr_label = int(seg_labels[i + 1])
                     sub_pts = [refined_pts_arr[i + 1]]
+                    sub_start_index = i + 1
 
     if debug_intersections:
         marker_points = np.asarray(debug_intersections, dtype=float)
-        new_trajectory.append(TrajectorySegment(
-            kind="INTERSECTION_MARKER",
-            uv=np.full((len(marker_points), 2), np.nan),
-            xyz=marker_points,
-            spray_on=False,
-            note="[DEBUG intersections]",
-            region="INTERSECTION_MARKER",
-            phases=np.zeros(len(marker_points), dtype=int),
-        ))
+        new_trajectory.append(
+            TrajectorySegment(
+                kind="INTERSECTION_MARKER",
+                uv=np.full((len(marker_points), 2), np.nan),
+                xyz=marker_points,
+                spray_on=False,
+                note="[DEBUG intersections]",
+                region="INTERSECTION_MARKER",
+                phases=np.zeros(len(marker_points), dtype=int),
+            )
+        )
     return new_trajectory
 
     
@@ -6250,7 +6483,7 @@ class TkControlPanel:
         optimized = split_center_intrusions_3d(
             optimized, mesh=self.visualizer.mesh,
             intersection_tol=1.0,
-            extension_tol=0.5 * new_d,
+            extension_tol=1.0 * new_d,
         )
 
         if not self.visualizer.enable_energy_optimization:
@@ -6640,7 +6873,7 @@ def main() -> None:
 
     arc_trajectory = split_center_intrusions_3d(
         arc_trajectory, mesh=mesh, intersection_tol=1.0,
-        extension_tol=0.5 * selected_spacing,
+        extension_tol=1.0 * selected_spacing,
     )
 
     # 对优化后的每条喷涂轨迹做曲率自适应五次最小二乘拟合；过渡段保持原样。
