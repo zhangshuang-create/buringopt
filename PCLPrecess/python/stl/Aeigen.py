@@ -24,8 +24,7 @@ import trimesh
 import vtk
 from scipy.spatial import cKDTree
 from scipy.optimize import minimize, root_scalar
-from scipy.interpolate import BSpline, make_lsq_spline
-from scipy.optimize import minimize
+from scipy.interpolate import make_lsq_spline
 #截断变圆弧
 # This script lives one directory deeper than the other STL entrypoints:
 # .../PCLPrecess/python/stl/备份/linshi.py -> PCLPrecess.
@@ -36,9 +35,7 @@ ROOT = (_SCRIPT_PATH.parents[3]
 OPTCUTS_ROOT = ROOT / "third_party" / "OptCuts"
 OPTCUTS_EXE = OPTCUTS_ROOT / "build" / "Release" / "OptCuts_bin.exe"
 FINAL_FRAME_HOLD_MS = 2000
-DEFAULT_TRAJECTORY_SPACING = 5.0
-DEFAULT_A_MAX = 20000.0
-DEFAULT_J_MAX = 50000.0
+DEFAULT_TRAJECTORY_SPACING = 30.0
 DEFAULT_TRAJECTORY_SPEED = 300.0
 DEFAULT_SPRAY_DISTANCE = 0.0
 EPS = 1.0e-9
@@ -1438,9 +1435,224 @@ def _logical_surface_tracks(trajectory: Sequence[TrajectorySegment]) -> list[dic
     return tracks
 
 
+def _segment_distance_3d(first: np.ndarray, second: np.ndarray) -> float:
+    """Return the shortest distance between two finite 3D segments."""
+    p0, p1 = np.asarray(first, float)
+    q0, q1 = np.asarray(second, float)
+    u, v, w = p1 - p0, q1 - q0, p0 - q0
+    a, b, c = float(u @ u), float(u @ v), float(v @ v)
+    d, e = float(u @ w), float(v @ w)
+    denominator = a * c - b * b
+    s_num, s_den = denominator, denominator
+    t_num, t_den = denominator, denominator
+    if denominator <= EPS:
+        s_num, s_den, t_num, t_den = 0.0, 1.0, e, c
+    else:
+        s_num = b * e - c * d
+        t_num = a * e - b * d
+        if s_num < 0.0:
+            s_num, t_num, t_den = 0.0, e, c
+        elif s_num > s_den:
+            s_num, t_num, t_den = s_den, e + b, c
+    if t_num < 0.0:
+        t_num = 0.0
+        if -d < 0.0:
+            s_num = 0.0
+        elif -d > a:
+            s_num = s_den
+        else:
+            s_num, s_den = -d, a
+    elif t_num > t_den:
+        t_num = t_den
+        if -d + b < 0.0:
+            s_num = 0.0
+        elif -d + b > a:
+            s_num = s_den
+        else:
+            s_num, s_den = -d + b, a
+    s = 0.0 if abs(s_num) <= EPS else s_num / max(s_den, EPS)
+    t = 0.0 if abs(t_num) <= EPS else t_num / max(t_den, EPS)
+    return float(np.linalg.norm(w + s * u - t * v))
+
+
+def _line_to_points_distance(line: np.ndarray, points: np.ndarray) -> float:
+    samples = np.linspace(np.asarray(line[0], float), np.asarray(line[1], float), 17)
+    return float(np.min(cKDTree(np.asarray(points, float)).query(samples)[0]))
+
+
+def _track_slice(points: np.ndarray, start: np.ndarray, end: np.ndarray) -> np.ndarray:
+    """Follow a sampled track from the point nearest start to the point nearest end."""
+    points = np.asarray(points, float)
+    tree = cKDTree(points)
+    start_idx = int(tree.query(np.asarray(start, float))[1])
+    end_idx = int(tree.query(np.asarray(end, float))[1])
+    if start_idx <= end_idx:
+        middle = points[start_idx:end_idx + 1]
+    else:
+        middle = points[start_idx::-1] if end_idx == 0 else points[start_idx:end_idx - 1:-1]
+    return np.vstack([np.asarray(start, float), middle, np.asarray(end, float)])
+
+
+def _points_in_polygon(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    """Vectorized even-odd test for a 2D polygon."""
+    x, y = points[:, 0], points[:, 1]
+    px, py = polygon[:, 0], polygon[:, 1]
+    inside = np.zeros(len(points), dtype=bool)
+    previous = len(polygon) - 1
+    for current in range(len(polygon)):
+        crosses = ((py[current] > y) != (py[previous] > y)) & (
+            x < (px[previous] - px[current]) * (y - py[current])
+            / (py[previous] - py[current] + EPS) + px[current]
+        )
+        inside ^= crosses
+        previous = current
+    return inside
+
+
+def _local_connected_face_mask(
+    mesh: trimesh.Trimesh,
+    candidate_mask: np.ndarray,
+    boundary_points: np.ndarray,
+) -> np.ndarray:
+    """Keep the candidate face component attached to the local boundary."""
+    candidate_ids = np.flatnonzero(candidate_mask)
+    if not len(candidate_ids):
+        return candidate_mask
+    triangle_centers = np.asarray(mesh.triangles_center, dtype=float)
+    boundary_tree = cKDTree(np.asarray(boundary_points, dtype=float))
+    seed = int(candidate_ids[np.argmin(
+        boundary_tree.query(triangle_centers[candidate_ids])[0]
+    )])
+
+    allowed = np.asarray(candidate_mask, dtype=bool)
+    graph: dict[int, list[int]] = {}
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    adjacency = adjacency[np.all(allowed[adjacency], axis=1)]
+    for first, second in adjacency:
+        first, second = int(first), int(second)
+        graph.setdefault(first, []).append(second)
+        graph.setdefault(second, []).append(first)
+
+    component = np.zeros(len(candidate_mask), dtype=bool)
+    component[seed] = True
+    stack = [seed]
+    while stack:
+        face = stack.pop()
+        for neighbour in graph.get(face, ()):
+            if not component[neighbour]:
+                component[neighbour] = True
+                stack.append(neighbour)
+    return component
+
+
+def _project_to_mesh(mesh: trimesh.Trimesh | None, point: np.ndarray) -> np.ndarray | None:
+    if mesh is None or point is None or not np.isfinite(point).all():
+        return None
+    try:
+        projected, _, _ = trimesh.proximity.closest_point(mesh, np.asarray(point, float)[None, :])
+        return np.asarray(projected[0], float)
+    except Exception:
+        try:
+            projected, _, _ = trimesh.proximity.closest_point_naive(
+                mesh, np.asarray(point, float)[None, :]
+            )
+            return np.asarray(projected[0], float)
+        except Exception:
+            vertices = np.asarray(mesh.vertices, float)
+            return vertices[int(cKDTree(vertices).query(np.asarray(point, float))[1])] if len(vertices) else None
+
+
+def _closed_polyline_center(points: np.ndarray) -> np.ndarray:
+    """Geometric centroid of a sampled 3D curve closed by its endpoint chord."""
+    points = np.asarray(points, float)
+    return np.mean(points, axis=0)
+
+
+def _radial_barrier_state(
+    points: np.ndarray,
+    barriers: Sequence[dict[str, object]],
+    spacing: float,
+    stiffness: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate the strongest radial hard barrier at each point."""
+    points = np.asarray(points, float)
+    count = len(points)
+    force = np.zeros_like(points)
+    direction = np.zeros_like(points)
+    magnitude = np.zeros(count, dtype=float)
+    dangerous = np.zeros(count, dtype=bool)
+    inside_any = np.zeros(count, dtype=bool)
+    escape_step = np.zeros(count, dtype=float)
+    d = max(float(spacing), EPS)
+    inner_limit = 0.8 * d
+    outer_limit = 1.2 * d
+
+    for barrier in barriers:
+        center = np.asarray(barrier["center"], float)
+        tree = barrier["tree"]
+        distance, nearest_index = tree.query(points)
+        nearest_index = np.asarray(nearest_index, dtype=np.intp)
+        tree_points = np.asarray(tree.data, dtype=float)
+        nearest = tree_points[nearest_index]
+        ray = points - center
+        radius = np.linalg.norm(ray, axis=1)
+        valid = radius > 1.0e-8
+        unit = np.zeros_like(points)
+        unit[valid] = ray[valid] / radius[valid, None]
+        boundary_radius = np.linalg.norm(nearest - center, axis=1)
+        at_center = ~valid & (boundary_radius > 1.0e-8)
+        unit[at_center] = (
+            (nearest[at_center] - center)
+            / boundary_radius[at_center, None]
+        )
+        inside = radius < boundary_radius - 1.0e-6 * d
+        ultra_close = (~inside) & (distance < inner_limit)
+        transition = (~inside) & (~ultra_close) & (distance < outer_limit)
+
+        local_magnitude = np.zeros(count, dtype=float)
+        depth = np.maximum(boundary_radius - radius, 0.0) / d
+        local_magnitude[inside] = stiffness * (
+            20.0 + 20.0 * depth[inside] + 10.0 * depth[inside] ** 2
+        )
+        close_ratio = np.clip((inner_limit - distance) / inner_limit, 0.0, 1.0)
+        local_magnitude[ultra_close] = stiffness * (
+            3.0 + 17.0 * close_ratio[ultra_close] ** 2
+        )
+        transition_t = np.clip(
+            (outer_limit - distance) / max(outer_limit - inner_limit, EPS),
+            0.0,
+            1.0,
+        )
+        transition_smooth = transition_t ** 2 * (3.0 - 2.0 * transition_t)
+        local_magnitude[transition] = stiffness * 3.0 * transition_smooth[transition]
+
+        stronger = local_magnitude > magnitude
+        if np.any(stronger):
+            magnitude[stronger] = local_magnitude[stronger]
+            direction[stronger] = unit[stronger]
+        dangerous |= inside | ultra_close
+        inside_any |= inside
+
+        needed = np.where(
+            inside,
+            np.maximum(boundary_radius - radius, 0.0) + 0.85 * d,
+            np.maximum(0.85 * d - distance, 0.0),
+        )
+        local_escape = np.where(
+            inside | ultra_close,
+            np.clip(needed, 0.6 * d, 0.8 * d),
+            0.0,
+        )
+        escape_step = np.maximum(escape_step, local_escape)
+
+    force = direction * magnitude[:, None]
+    return force, direction, dangerous, inside_any, escape_step
+
+
 def _special_boundary_geometry(
     trajectory: Sequence[TrajectorySegment],
     spacing: float,
+    mesh: trimesh.Trimesh | None = None,
 ) -> dict[str, object]:
     """Find periodic center-end neighbours and blue boundary connectors.
 
@@ -1487,6 +1699,11 @@ def _special_boundary_geometry(
             "tracks": [],
             "connectors_3d": [],
             "connectors_2d": [],
+            "connector_records": [],
+            "selected_void_connectors_3d": {},
+            "blank_centers_3d": {},
+            "repulsion_centers_3d": {},
+            "void_center_eligibility": {},
             "target_distance": target,
         }
 
@@ -1495,8 +1712,8 @@ def _special_boundary_geometry(
     special_tracks: list[dict[str, object]] = [c_first, c_last] if len(center) > 1 else [c_first]
 
     # 1. 基础匹配：center 内部首尾闭环 (C_first <-> C_last)
-    pairs: list[tuple[dict[str, object], dict[str, object]]] = [
-        (c_first, c_last),
+    pairs: list[tuple[dict[str, object], dict[str, object], str, str | None]] = [
+        (c_first, c_last, "PERIODIC", None),
     ]
 
     # 2. 跨区独立匹配：为 C_first 和 C_last 分别独立寻找最近的分支
@@ -1523,14 +1740,15 @@ def _special_boundary_geometry(
         special_tracks.append(cand_first)
         special_tracks.append(cand_last)
 
-        pairs.append((c_first, cand_first))
-        pairs.append((c_last, cand_last))
+        pairs.append((c_first, cand_first, "FIRST", region))
+        pairs.append((c_last, cand_last, "LAST", region))
 
     connectors_3d: list[list[list[float]]] = []
     connectors_2d: list[list[list[float]]] = []
+    connector_records: list[dict[str, object]] = []
 
     # 3. 求解所有匹配对的 1.5d 等距截断点
-    for centre_track, outer_track in pairs:
+    for centre_track, outer_track, centre_role, boundary_region in pairs:
         c_xyz = np.asarray(centre_track["xyz"], float)
         o_xyz = np.asarray(outer_track["xyz"], float)
         c_uv = np.asarray(centre_track["uv"], float)
@@ -1560,11 +1778,23 @@ def _special_boundary_geometry(
             roots.append((c_xyz[-1], o_xyz[int(o_idx)], len(values) - 2, 1.0))
 
         for point, o_point, index, ratio in roots:
-            connectors_3d.append([point.tolist(), o_point.tolist()])
+            line_3d = [point.tolist(), o_point.tolist()]
+            connectors_3d.append(line_3d)
+            line_2d = None
             if len(c_uv) == len(c_xyz) and len(o_uv):
                 uv_point = c_uv[index] + ratio * (c_uv[index + 1] - c_uv[index])
                 _, o_uv_idx = cKDTree(o_xyz).query(o_point)
-                connectors_2d.append([uv_point.tolist(), o_uv[int(o_uv_idx)].tolist()])
+                line_2d = [uv_point.tolist(), o_uv[int(o_uv_idx)].tolist()]
+                connectors_2d.append(line_2d)
+            connector_records.append({
+                "kind": "PERIODIC" if centre_role == "PERIODIC" else "BOUNDARY",
+                "side": boundary_region,
+                "center_role": centre_role,
+                "line_3d": line_3d,
+                "line_2d": line_2d,
+                "outer_segment_index": outer_track.get("segment_index"),
+                "outer_phase": outer_track.get("phase"),
+            })
 
     # 4. 边界端点直连：若某侧无 UPPER 或 LOWER，直接连接该侧在物理边界上的两个端点
     if len(center) >= 2 and (not has_lower or not has_upper):
@@ -1615,11 +1845,211 @@ def _special_boundary_geometry(
 
         for p_idx in connect_pair_indices:
             pair_data = end_pairs[p_idx]
-            connectors_3d.append([pair_data["p1"].tolist(), pair_data["p2"].tolist()])
+            line_3d = [pair_data["p1"].tolist(), pair_data["p2"].tolist()]
+            connectors_3d.append(line_3d)
+            line_2d = None
             if pair_data["uv1"] is not None and pair_data["uv2"] is not None:
-                connectors_2d.append([pair_data["uv1"].tolist(), pair_data["uv2"].tolist()])
+                line_2d = [pair_data["uv1"].tolist(), pair_data["uv2"].tolist()]
+                connectors_2d.append(line_2d)
+            missing_side = (
+                "UPPER" if has_lower and not has_upper else
+                "LOWER" if has_upper and not has_lower else
+                ("LOWER" if p_idx == 0 else "UPPER")
+            )
+            connector_records.append({
+                "kind": "MODEL_BOUNDARY",
+                "side": missing_side,
+                "center_role": "ENDPOINTS",
+                "line_3d": line_3d,
+                "line_2d": line_2d,
+                "outer_segment_index": None,
+                "outer_phase": None,
+            })
 
     # 去重并输出
+    # Keep the hard-boundary choice identical to intrusion handling.
+    raw_boundary_tracks: dict[str, np.ndarray] = {}
+    for side in ("LOWER", "UPPER"):
+        candidates = [
+            np.asarray(seg.xyz, float) for seg in trajectory
+            if seg.kind == "SURFACE_SCAN"
+            and str(getattr(seg, "region", "")).upper() == side
+            and len(seg.xyz) >= 2
+        ]
+        if candidates:
+            raw_boundary_tracks[side] = candidates[-1] if side == "LOWER" else candidates[0]
+
+    periodic_records = [r for r in connector_records if r["kind"] == "PERIODIC"]
+    direct_by_side = {
+        str(r["side"]): r for r in connector_records if r["kind"] == "MODEL_BOUNDARY"
+    }
+    side_targets: dict[str, np.ndarray] = {}
+    for side in ("LOWER", "UPPER"):
+        if side in raw_boundary_tracks:
+            side_targets[side] = raw_boundary_tracks[side]
+        elif side in direct_by_side:
+            side_targets[side] = np.asarray(direct_by_side[side]["line_3d"], float)
+
+    periodic_for_side: dict[str, dict[str, object]] = {}
+    available_sides = [side for side in ("LOWER", "UPPER") if side in side_targets]
+    if len(periodic_records) == 1:
+        for side in available_sides:
+            periodic_for_side[side] = periodic_records[0]
+    elif len(periodic_records) == 2 and len(available_sides) == 2:
+        # Exactly two lines: use the requested minimum-total-distance matching.
+        _, lower_index, upper_index = min(
+            (
+                _line_to_points_distance(np.asarray(periodic_records[i]["line_3d"], float), side_targets["LOWER"])
+                + _line_to_points_distance(np.asarray(periodic_records[j]["line_3d"], float), side_targets["UPPER"]),
+                i,
+                j,
+            )
+            for i in range(len(periodic_records))
+            for j in range(len(periodic_records))
+            if i != j
+        )
+        periodic_for_side["LOWER"] = periodic_records[lower_index]
+        periodic_for_side["UPPER"] = periodic_records[upper_index]
+    elif len(periodic_records) > 2:
+        # More than two lines: each side independently takes its nearest line.
+        for side in available_sides:
+            periodic_for_side[side] = min(
+                periodic_records,
+                key=lambda record: _line_to_points_distance(
+                    np.asarray(record["line_3d"], float), side_targets[side]
+                ),
+            )
+    elif periodic_records:
+        for side in available_sides:
+            periodic_for_side[side] = min(
+                periodic_records,
+                key=lambda record: _line_to_points_distance(
+                    np.asarray(record["line_3d"], float), side_targets[side]
+                ),
+            )
+
+    selected_records: dict[str, list[dict[str, object]]] = {}
+    selected_void_connectors_3d: dict[str, list[list[list[float]]]] = {}
+    blank_centers_3d: dict[str, list[float]] = {}
+    repulsion_centers_3d: dict[str, list[float]] = {}
+    void_center_eligibility: dict[str, dict[str, object]] = {}
+    for side, boundary_track in raw_boundary_tracks.items():
+        projected = _project_to_mesh(mesh, _closed_polyline_center(boundary_track))
+        if projected is not None:
+            repulsion_centers_3d[side] = projected.tolist()
+
+    all_spray_points = [
+        np.asarray(seg.xyz, float) for seg in trajectory
+        if seg.kind == "SURFACE_SCAN" and len(seg.xyz) >= 2
+    ]
+    spray_tree = cKDTree(np.vstack(all_spray_points)) if all_spray_points else None
+    triangle_centers = (
+        np.asarray(mesh.triangles_center, float) if mesh is not None else np.empty((0, 3))
+    )
+
+    for side, periodic_record in periodic_for_side.items():
+        if side not in raw_boundary_tracks:
+            void_center_eligibility[side] = {
+                "eligible": False,
+                "reason": "missing_boundary_trajectory",
+            }
+            continue
+        boundary_tree = cKDTree(raw_boundary_tracks[side])
+        first_max_gap = float(np.max(boundary_tree.query(
+            np.asarray(c_first["xyz"], float)
+        )[0]))
+        last_max_gap = float(np.max(boundary_tree.query(
+            np.asarray(c_last["xyz"], float)
+        )[0]))
+        gap_tolerance = 1.0e-9 * max(target, 1.0)
+        first_has_void = first_max_gap > target + gap_tolerance
+        last_has_void = last_max_gap > target + gap_tolerance
+        side_is_eligible = bool(first_has_void and last_has_void)
+        void_center_eligibility[side] = {
+            "eligible": side_is_eligible,
+            "c0_max_gap": first_max_gap,
+            "c_last_max_gap": last_max_gap,
+            "required_gap": target,
+        }
+        if not side_is_eligible:
+            continue
+
+        periodic_line = np.asarray(periodic_record["line_3d"], float)
+        chosen = [periodic_record]
+        polygon_parts: list[np.ndarray] = []
+        if side in raw_boundary_tracks:
+            boundary_candidates = [
+                r for r in connector_records
+                if r["kind"] == "BOUNDARY" and r["side"] == side
+            ]
+            first_candidates = [r for r in boundary_candidates if r["center_role"] == "FIRST"]
+            last_candidates = [r for r in boundary_candidates if r["center_role"] == "LAST"]
+            if not first_candidates or not last_candidates:
+                continue
+            first_record = min(
+                first_candidates,
+                key=lambda r: _segment_distance_3d(periodic_line, np.asarray(r["line_3d"], float)),
+            )
+            last_record = min(
+                last_candidates,
+                key=lambda r: _segment_distance_3d(periodic_line, np.asarray(r["line_3d"], float)),
+            )
+            chosen.extend([first_record, last_record])
+            first_line = np.asarray(first_record["line_3d"], float)
+            last_line = np.asarray(last_record["line_3d"], float)
+            polygon_parts = [
+                _track_slice(np.asarray(c_first["xyz"], float), periodic_line[0], first_line[0]),
+                first_line,
+                _track_slice(raw_boundary_tracks[side], first_line[1], last_line[1]),
+                last_line[::-1],
+                _track_slice(np.asarray(c_last["xyz"], float), last_line[0], periodic_line[1]),
+            ]
+        elif side in direct_by_side:
+            direct_record = direct_by_side[side]
+            direct_line = np.asarray(direct_record["line_3d"], float)
+            direct_cost = np.linalg.norm(np.asarray(c_first["xyz"], float) - direct_line[0], axis=1).min()
+            reverse_cost = np.linalg.norm(np.asarray(c_first["xyz"], float) - direct_line[1], axis=1).min()
+            if reverse_cost < direct_cost:
+                direct_line = direct_line[::-1]
+            chosen.append(direct_record)
+            polygon_parts = [
+                _track_slice(np.asarray(c_first["xyz"], float), periodic_line[0], direct_line[0]),
+                direct_line,
+                _track_slice(np.asarray(c_last["xyz"], float), direct_line[1], periodic_line[1]),
+            ]
+
+        selected_records[side] = chosen
+        selected_void_connectors_3d[side] = [r["line_3d"] for r in chosen]
+        if mesh is None or spray_tree is None or not polygon_parts or not len(triangle_centers):
+            continue
+        polygon_3d = np.vstack([part[:-1] for part in polygon_parts] + [polygon_parts[-1][-1:]])
+        if len(polygon_3d) < 3:
+            continue
+        origin = np.mean(polygon_3d, axis=0)
+        _, _, vh = np.linalg.svd(polygon_3d - origin, full_matrices=False)
+        basis = vh[:2]
+        polygon_2d = (polygon_3d - origin) @ basis.T
+        in_region = _points_in_polygon((triangle_centers - origin) @ basis.T, polygon_2d)
+        if len(vh) >= 3:
+            normal = vh[2]
+            boundary_plane_depth = np.abs((polygon_3d - origin) @ normal)
+            plane_limit = (
+                float(np.percentile(boundary_plane_depth, 95))
+                + 0.75 * max(target / 1.5, EPS)
+            )
+            in_region &= (
+                np.abs((triangle_centers - origin) @ normal) <= plane_limit
+            )
+        in_region = _local_connected_face_mask(mesh, in_region, polygon_3d)
+        candidate_ids = np.flatnonzero(in_region)
+        if not len(candidate_ids):
+            continue
+        void_distances = spray_tree.query(triangle_centers[candidate_ids])[0]
+        best_center = triangle_centers[candidate_ids[int(np.argmax(void_distances))]]
+        projected = _project_to_mesh(mesh, best_center)
+        if projected is not None:
+            blank_centers_3d[side] = projected.tolist()
+
     unique_tracks = []
     seen = set()
     for t in special_tracks:
@@ -1636,677 +2066,15 @@ def _special_boundary_geometry(
         "tracks": unique_tracks,
         "connectors_3d": connectors_3d,
         "connectors_2d": connectors_2d,
+        "connector_records": connector_records,
+        "selected_connector_records": selected_records,
+        "selected_void_connectors_3d": selected_void_connectors_3d,
+        "blank_centers_3d": blank_centers_3d,
+        "repulsion_centers_3d": repulsion_centers_3d,
+        "void_center_eligibility": void_center_eligibility,
         "target_distance": target,
     }
 
-
-# =========================================================================
-# 3D 空间无畸变侵入求交与分段核心算法
-# =========================================================================
-def _find_3d_segment_closest_point(
-    p1: np.ndarray, p2: np.ndarray, q1: np.ndarray, q2: np.ndarray
-) -> tuple[float, float, float]:
-    """计算三维空间中两线段 p1-p2 与 q1-q2 的最短欧氏距离及参数 (u, v)。"""
-    d1 = p2 - p1
-    d2 = q2 - q1
-    r = p1 - q1
-    a = float(np.dot(d1, d1))
-    e = float(np.dot(d2, d2))
-    f = float(np.dot(d2, r))
-
-    if a <= 1e-9 and e <= 1e-9:
-        return float(np.linalg.norm(r)), 0.0, 0.0
-    if a <= 1e-9:
-        v = float(np.clip(f / e, 0.0, 1.0))
-        return float(np.linalg.norm(p1 - (q1 + v * d2))), 0.0, v
-    if e <= 1e-9:
-        c = float(np.dot(d1, r))
-        u = float(np.clip(-c / a, 0.0, 1.0))
-        return float(np.linalg.norm((p1 + u * d1) - q1)), u, 0.0
-
-    b = float(np.dot(d1, d2))
-    c = float(np.dot(d1, r))
-    denom = a * e - b * b
-
-    if abs(denom) > 1e-9:
-        u = float(np.clip((b * f - c * e) / denom, 0.0, 1.0))
-    else:
-        u = 0.0
-
-    v = (b * u + f) / e
-    if v < 0.0:
-        v = 0.0
-        u = float(np.clip(-c / a, 0.0, 1.0))
-    elif v > 1.0:
-        v = 1.0
-        u = float(np.clip((b - c) / a, 0.0, 1.0))
-
-    p_close = p1 + u * d1
-    q_close = q1 + v * d2
-    dist = float(np.linalg.norm(p_close - q_close))
-    return dist, u, float(v)
-
-
-def _compute_3d_polyline_winding_or_side(
-    query_pts: np.ndarray, boundary_loop: np.ndarray, mesh: trimesh.Trimesh
-) -> np.ndarray:
-    """基于曲面局部测地法向与切平面，判断三维点集是否位于边界封闭环内侧。"""
-    loop_center = np.mean(boundary_loop, axis=0)
-    loop_tree = cKDTree(boundary_loop)
-    inside_flags = np.zeros(len(query_pts), dtype=bool)
-
-    for i, pt in enumerate(query_pts):
-        _, near_idx = loop_tree.query(pt)
-        b_pt = boundary_loop[near_idx]
-
-        # 边界局部切向
-        next_idx = (near_idx + 1) % len(boundary_loop)
-        prev_idx = (near_idx - 1 + len(boundary_loop)) % len(boundary_loop)
-        tangent = boundary_loop[next_idx] - boundary_loop[prev_idx]
-        t_norm = np.linalg.norm(tangent)
-        tangent = tangent / t_norm if t_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
-
-        # 投影到最近面片获取曲面外法向
-        _, _, face_id = trimesh.proximity.closest_point(mesh, [pt])
-        normal = mesh.face_normals[face_id[0]]
-
-        # 计算切平面指向闭环内部的内向向量
-        inward_dir = np.cross(normal, tangent)
-        if np.dot(inward_dir, loop_center - b_pt) < 0:
-            inward_dir = -inward_dir
-        inward_dir /= max(float(np.linalg.norm(inward_dir)), 1e-9)
-
-        # 点在内侧半平面即判定为侵入
-        inside_flags[i] = (np.dot(pt - b_pt, inward_dir) > -1e-4)
-
-    return inside_flags
-
-def split_center_intrusions_3d(
-    trajectory: list[TrajectorySegment],
-    mesh: trimesh.Trimesh,
-    intersection_tol: float = 1.0,
-    extension_tol: float = 0.0,
-) -> list[TrajectorySegment]:
-    """在真实 3D 空间进行精准求交并切分为 CENTER(黄色) 与 CENTER_INTRUDED(红色)。"""
-    center_tracks = [
-        s
-        for s in trajectory
-        if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "CENTER"
-    ]
-    boundary_tracks = [
-        s
-        for s in trajectory
-        if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") in ("LOWER", "UPPER")
-    ]
-
-    if not center_tracks or not boundary_tracks:
-        return trajectory
-
-    # 1. 采用 shujutu 策略：找到离 CENTER 最近的最外侧 LOWER / UPPER 轨迹
-    def extract_outer_loop(region_name: str) -> np.ndarray | None:
-        cand = [
-            s
-            for s in boundary_tracks
-            if getattr(s, "region", "") == region_name and len(s.xyz) >= 2
-        ]
-        if not cand:
-            return None
-        best = cand[-1] if region_name == "LOWER" else cand[0]
-        pts = np.asarray(best.xyz, dtype=float)
-        return pts
-
-    lower_loop = extract_outer_loop("LOWER")
-    upper_loop = extract_outer_loop("UPPER")
-
-    all_boundary_loops = [loop for loop in (lower_loop, upper_loop) if loop is not None]
-    boundary_segment_records = [
-        (a, b, loop, "LOWER" if loop is lower_loop else "UPPER")
-        for loop in all_boundary_loops
-        for a, b in zip(loop[:-1], loop[1:])
-    ]
-    boundary_segment_tree = (
-        cKDTree(
-            np.asarray(
-                [0.5 * (a + b) for a, b, _, _ in boundary_segment_records], dtype=float
-            )
-        )
-        if boundary_segment_records
-        else None
-    )
-    boundary_segment_half_lengths = np.asarray(
-        [0.5 * float(np.linalg.norm(b - a)) for a, b, _, _ in boundary_segment_records],
-        dtype=float,
-    )
-    boundary_segment_max_half = float(
-        np.max(boundary_segment_half_lengths, initial=0.0)
-    )
-    if lower_loop is None and upper_loop is None:
-        return trajectory
-
-    def point_to_polyline_distance(point: np.ndarray, loop: np.ndarray) -> float:
-        """Distance to the boundary polyline, rather than only its vertices."""
-        if loop is None or len(loop) == 0:
-            return float("inf")
-        best = float("inf")
-        for a, b in zip(loop[:-1], loop[1:]):
-            edge = b - a
-            denom = float(np.dot(edge, edge))
-            ratio = (
-                0.0
-                if denom <= EPS
-                else float(np.clip(np.dot(point - a, edge) / denom, 0.0, 1.0))
-            )
-            best = min(best, float(np.linalg.norm(point - (a + ratio * edge))))
-        return best
-
-    def likely_intersects(points: np.ndarray, region: str) -> bool:
-        loop = lower_loop if region == "LOWER" else upper_loop
-        if loop is None or len(points) == 0:
-            return False
-        region_records = [
-            record for record in boundary_segment_records if record[3] == region
-        ]
-        if not region_records:
-            return False
-        region_tree = cKDTree(
-            np.asarray(
-                [0.5 * (q1 + q2) for q1, q2, _, _ in region_records], dtype=float
-            )
-        )
-        max_half = max(
-            (0.5 * float(np.linalg.norm(q2 - q1)) for q1, q2, _, _ in region_records),
-            default=0.0,
-        )
-        for p1, p2 in zip(points[:-1], points[1:]):
-            active_mid = 0.5 * (p1 + p2)
-            active_half = 0.5 * float(np.linalg.norm(p2 - p1))
-            for candidate in region_tree.query_ball_point(
-                active_mid, r=active_half + max_half + intersection_tol
-            ):
-                q1, q2, candidate_loop, _ = region_records[candidate]
-                distance, u, v = _find_3d_segment_closest_point(p1, p2, q1, q2)
-                if not (
-                    distance <= intersection_tol
-                    and 1.0e-6 < u < 1.0 - 1.0e-6
-                    and 1.0e-6 < v < 1.0 - 1.0e-6
-                ):
-                    continue
-                if (
-                    segment_side(p1, q1, q2, candidate_loop)
-                    * segment_side(p2, q1, q2, candidate_loop)
-                    < 0.0
-                ):
-                    return True
-        return False
-
-    intersection_cache: dict[tuple[int, str], bool] = {}
-    boundary_distance_cache: dict[tuple[str, str], tuple[int, np.ndarray, float]] = {}
-
-    def cached_intersects(track_index: int, points: np.ndarray, region: str) -> bool:
-        key = (int(track_index), region)
-        if key not in intersection_cache:
-            intersection_cache[key] = bool(likely_intersects(points, region))
-        return intersection_cache[key]
-
-    def segment_side(
-        point: np.ndarray, q1: np.ndarray, q2: np.ndarray, loop: np.ndarray
-    ) -> float:
-        """Signed side relative to the actual boundary segment being tested."""
-        tangent = np.asarray(q2, dtype=float) - np.asarray(q1, dtype=float)
-        norm = float(np.linalg.norm(tangent))
-        if norm <= EPS:
-            return 0.0
-        tangent /= norm
-        midpoint = 0.5 * (np.asarray(q1, dtype=float) + np.asarray(q2, dtype=float))
-        _, _, face_id = trimesh.proximity.closest_point(mesh, [midpoint])
-        normal = np.asarray(mesh.face_normals[int(face_id[0])], dtype=float)
-        side = np.cross(normal, tangent)
-        side_norm = float(np.linalg.norm(side))
-        if side_norm <= EPS:
-            return 0.0
-        side /= side_norm
-        if np.dot(side, np.mean(loop, axis=0) - midpoint) < 0.0:
-            side = -side
-        return float(np.dot(np.asarray(point, dtype=float) - midpoint, side))
-
-    candidate_state: dict[int, bool] = {}
-    candidate_regions: dict[int, set[str]] = {}
-    intrusion_groups: dict[tuple[str, str], dict[str, object]] = {}
-    track_region_group: dict[tuple[int, str], tuple[str, str]] = {}
-
-    center_count = len(center_tracks)
-
-    def build_intrusion_group(side_name: str, boundary_region: str) -> None:
-        loop = lower_loop if boundary_region == "LOWER" else upper_loop
-        if loop is None:
-            return
-
-        if side_name == "SMALL":
-            scan_indices = range(center_count)
-        elif side_name == "LARGE":
-            scan_indices = range(center_count - 1, -1, -1)
-        else:
-            raise ValueError(f"Unknown center side: {side_name}")
-
-        intruded_indices: list[int] = []
-        baseline_index: int | None = None
-        for idx in scan_indices:
-            points = np.asarray(center_tracks[idx].xyz, dtype=float)
-            hit = len(points) >= 2 and cached_intersects(idx, points, boundary_region)
-            if hit:
-                intruded_indices.append(idx)
-            else:
-                baseline_index = idx
-                break
-
-        if not intruded_indices or baseline_index is None:
-            return
-
-        group_key = (side_name, boundary_region)
-        intrusion_groups[group_key] = {
-            "indices": intruded_indices,
-            "baseline_index": baseline_index,
-        }
-        for idx in intruded_indices:
-            candidate_state[idx] = True
-            candidate_regions.setdefault(idx, set()).add(boundary_region)
-            track_region_group[(idx, boundary_region)] = group_key
-
-    for boundary_region in ("LOWER", "UPPER"):
-        build_intrusion_group("SMALL", boundary_region)
-        build_intrusion_group("LARGE", boundary_region)
-
-    new_trajectory: list[TrajectorySegment] = []
-    debug_intersections: list[np.ndarray] = []
-
-    # 2. 遍历 CENTER 轨迹求交与偏移
-    for seg in trajectory:
-        if seg.kind != "SURFACE_SCAN" or getattr(seg, "region", "") != "CENTER":
-            new_trajectory.append(seg)
-            continue
-
-        track_index = next(
-            (i for i, candidate in enumerate(center_tracks) if candidate is seg), None
-        )
-        if track_index not in candidate_state:
-            new_trajectory.append(seg)
-            continue
-
-        xyz = np.asarray(seg.xyz, dtype=float)
-        if len(xyz) < 2:
-            new_trajectory.append(seg)
-            continue
-
-        dense_step = max(min(float(intersection_tol), 1.0), 0.25)
-        dense_points = [xyz[0]]
-        for start, end in zip(xyz[:-1], xyz[1:]):
-            length = float(np.linalg.norm(end - start))
-            count = max(1, int(math.ceil(length / dense_step)))
-            for fraction in np.linspace(1.0 / count, 1.0, count):
-                dense_points.append(start + fraction * (end - start))
-        xyz = np.asarray(dense_points, dtype=float)
-
-        refined_pts = [xyz[0]]
-        intersection_points = []
-        intersection_vertex_indices = []
-        for i in range(len(xyz) - 1):
-            p1, p2 = xyz[i], xyz[i + 1]
-            intersections_on_seg = []
-
-            local_candidates = set()
-            if boundary_segment_tree is not None:
-                active_midpoint = 0.5 * (p1 + p2)
-                active_half = 0.5 * float(np.linalg.norm(p2 - p1))
-                query_radius = (
-                    active_half + boundary_segment_max_half + intersection_tol
-                )
-                local_candidates.update(
-                    boundary_segment_tree.query_ball_point(
-                        active_midpoint, r=query_radius
-                    )
-                )
-            for seg_index in local_candidates:
-                q1, q2, loop, boundary_region = boundary_segment_records[seg_index]
-                dist, u, v = _find_3d_segment_closest_point(p1, p2, q1, q2)
-                if not (
-                    dist <= intersection_tol
-                    and 1e-4 < u < (1.0 - 1e-4)
-                    and 1e-4 < v < (1.0 - 1e-4)
-                ):
-                    continue
-                side_a = segment_side(p1, q1, q2, loop)
-                side_b = segment_side(p2, q1, q2, loop)
-                if side_a * side_b >= 0.0:
-                    continue
-                point = p1 + u * (p2 - p1)
-                intersections_on_seg.append((u, point, boundary_region))
-
-            intersections_on_seg.sort(key=lambda item: item[0])
-            for _, pt, boundary_region in intersections_on_seg:
-                intersection_points.append((pt, boundary_region))
-                refined_pts.append(pt)
-                intersection_vertex_indices.append(len(refined_pts) - 1)
-            refined_pts.append(p2)
-
-        refined_pts_arr = np.asarray(refined_pts, dtype=float)
-        debug_intersections.extend(point for point, _ in intersection_points)
-
-        # 3. 判定微段中点是否在封闭多边形内部
-        seg_labels = np.zeros(len(refined_pts_arr) - 1, dtype=int)
-        selected_contacts = []
-        for boundary_region in ("LOWER", "UPPER"):
-            region_hits = [
-                (index, point)
-                for index, (point, region) in zip(
-                    intersection_vertex_indices, intersection_points
-                )
-                if region == boundary_region
-            ]
-            if len(region_hits) >= 2:
-                selected_contacts.append(
-                    (region_hits[0][0], region_hits[-1][0], boundary_region)
-                )
-
-        extension_tol = max(float(extension_tol), 0.0)
-
-        def near_boundary_segment(index: int, loop: np.ndarray | None) -> bool:
-            if loop is None or index < 0 or index >= len(refined_pts_arr) - 1:
-                return False
-            a, b = refined_pts_arr[index], refined_pts_arr[index + 1]
-            return (
-                point_to_polyline_distance(a, loop) <= extension_tol
-                and point_to_polyline_distance(b, loop) <= extension_tol
-            )
-
-        intervals = []
-        for first, second, boundary_region in selected_contacts:
-            loop = lower_loop if boundary_region == "LOWER" else upper_loop
-            while first > 0 and near_boundary_segment(first - 1, loop):
-                first -= 1
-            while second < len(refined_pts_arr) - 1 and near_boundary_segment(
-                second, loop
-            ):
-                second += 1
-            intervals.append((first, second, boundary_region))
-
-        for pair_id, (first, second, _) in enumerate(sorted(intervals), start=1):
-            if second > first:
-                seg_labels[first:second] = pair_id
-
-        # =====================================================================
-        # 优化后半段：高速等分外推（Shift）+ 局部曲面贴合 + 快速拆分缝合
-        # =====================================================================
-        original_refined_pts_arr = refined_pts_arr.copy()
-        active_regions = candidate_regions.get(track_index, set())
-
-        if active_regions:
-
-            def _resample_reference_fast(
-                ref_pts: np.ndarray, target_params: np.ndarray
-            ) -> np.ndarray:
-                target_params = np.asarray(target_params, dtype=float)
-                if len(ref_pts) < 2:
-                    return np.repeat(ref_pts[:1], len(target_params), axis=0)
-                dists = np.linalg.norm(np.diff(ref_pts, axis=0), axis=1)
-                cum = np.r_[0.0, np.cumsum(dists)]
-                total = float(cum[-1])
-                if total <= EPS:
-                    return np.repeat(ref_pts[:1], len(target_params), axis=0)
-                ref_params = cum / total
-                keep = np.r_[True, np.diff(ref_params) > 1.0e-12]
-                ref_params = ref_params[keep]
-                ref_pts = ref_pts[keep]
-                s_targets = np.clip(target_params, 0.0, 1.0)
-                out = np.empty((len(s_targets), 3), dtype=float)
-                for axis in range(3):
-                    out[:, axis] = np.interp(s_targets, ref_params, ref_pts[:, axis])
-                return out
-
-            def _normalized_arc_params(points: np.ndarray) -> np.ndarray:
-                if len(points) == 0:
-                    return np.zeros(0, dtype=float)
-                if len(points) == 1:
-                    return np.zeros(1, dtype=float)
-                lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-                cum = np.r_[0.0, np.cumsum(lengths)]
-                total = float(cum[-1])
-                if total <= EPS:
-                    return np.linspace(0.0, 1.0, len(points))
-                return cum / total
-
-            def _orient_reference_to(
-                ref_pts: np.ndarray, target_pts: np.ndarray
-            ) -> np.ndarray:
-                ref_pts = np.asarray(ref_pts, dtype=float)
-                target_pts = np.asarray(target_pts, dtype=float)
-                if len(ref_pts) < 2 or len(target_pts) < 2:
-                    return ref_pts
-                forward = float(
-                    np.linalg.norm(ref_pts[0] - target_pts[0])
-                    + np.linalg.norm(ref_pts[-1] - target_pts[-1])
-                )
-                reversed_cost = float(
-                    np.linalg.norm(ref_pts[-1] - target_pts[0])
-                    + np.linalg.norm(ref_pts[0] - target_pts[-1])
-                )
-                return ref_pts[::-1] if reversed_cost < forward else ref_pts
-
-            def _global_polyline_min_distance(
-                first_pts: np.ndarray, second_pts: np.ndarray
-            ) -> float:
-                if len(first_pts) < 2 or len(second_pts) < 2:
-                    return float("inf")
-                best = float("inf")
-                for p1, p2 in zip(first_pts[:-1], first_pts[1:]):
-                    for q1, q2 in zip(second_pts[:-1], second_pts[1:]):
-                        dist, _, _ = _find_3d_segment_closest_point(p1, p2, q1, q2)
-                        best = min(best, float(dist))
-                return best
-
-            shifted = refined_pts_arr.copy()
-            current_params = _normalized_arc_params(original_refined_pts_arr)
-
-            for boundary_region in sorted(active_regions):
-                loop = lower_loop if boundary_region == "LOWER" else upper_loop
-                if loop is None:
-                    continue
-
-                group_key = track_region_group.get((track_index, boundary_region))
-                if group_key is None:
-                    continue
-                group = intrusion_groups.get(group_key)
-                if group is None:
-                    continue
-
-                side_name = group_key[0]
-                region_intruded_indices = list(group["indices"])
-                baseline_index = int(group["baseline_index"])
-
-                if not region_intruded_indices:
-                    continue
-
-                dist_cache_key = (boundary_region, side_name)
-                if dist_cache_key not in boundary_distance_cache:
-                    baseline_pts = np.asarray(
-                        center_tracks[baseline_index].xyz, dtype=float
-                    )
-                    d1_val = _global_polyline_min_distance(baseline_pts, loop)
-                    boundary_distance_cache[dist_cache_key] = (
-                        baseline_index,
-                        baseline_pts,
-                        d1_val,
-                    )
-
-                _, baseline, d1 = boundary_distance_cache[dist_cache_key]
-                current = original_refined_pts_arr
-                if len(baseline) < 2 or len(current) < 2:
-                    continue
-                if not np.isfinite(d1) or d1 <= EPS:
-                    continue
-
-                baseline = _orient_reference_to(baseline, current)
-                loop_for_direction = _orient_reference_to(loop, baseline)
-                baseline_on_current = _resample_reference_fast(baseline, current_params)
-                boundary_on_current = _resample_reference_fast(
-                    loop_for_direction, current_params
-                )
-                n_intruded = len(region_intruded_indices)
-
-                try:
-                    position = region_intruded_indices.index(track_index)
-                except ValueError:
-                    continue
-
-                delta_d = d1 / (n_intruded + 1)
-                offset = float(n_intruded - position) * delta_d
-
-                region_intervals = [
-                    (first, second)
-                    for first, second, r_name in intervals
-                    if r_name == boundary_region
-                ]
-
-                region_mask = np.zeros(len(refined_pts_arr), dtype=bool)
-                for first, second in region_intervals:
-                    region_mask[first : second + 1] = True
-
-                direction = boundary_on_current - baseline_on_current
-                direction_norm = np.linalg.norm(direction, axis=1)
-                valid = region_mask & (direction_norm > EPS)
-
-                if np.any(valid):
-                    push_dirs = direction[valid] / direction_norm[valid, None]
-                    shifted[valid] = baseline_on_current[valid] + push_dirs * offset
-
-                for first, second in region_intervals:
-                    if second <= first:
-                        continue
-                    midpoint = (first + second) // 2
-                    entry_range = np.arange(first, midpoint + 1)
-                    exit_range = np.arange(midpoint, second + 1)
-
-                    if len(entry_range) > 0:
-                        entry_idx = int(
-                            entry_range[
-                                np.argmin(
-                                    np.linalg.norm(
-                                        shifted[entry_range]
-                                        - original_refined_pts_arr[first],
-                                        axis=1,
-                                    )
-                                )
-                            ]
-                        )
-                        seg_labels[first:entry_idx] = 0
-
-                    if len(exit_range) > 0:
-                        exit_idx = int(
-                            exit_range[
-                                np.argmin(
-                                    np.linalg.norm(
-                                        shifted[exit_range]
-                                        - original_refined_pts_arr[second],
-                                        axis=1,
-                                    )
-                                )
-                            ]
-                        )
-                        seg_labels[exit_idx:second] = 0
-
-            moved_mask = (
-                np.linalg.norm(shifted - original_refined_pts_arr, axis=1) > 1e-4
-            )
-            if np.any(moved_mask):
-                try:
-                    proj_pts, _, _ = trimesh.proximity.closest_point(
-                        mesh, shifted[moved_mask]
-                    )
-                    shifted[moved_mask] = proj_pts
-                except Exception:
-                    pass
-
-            refined_pts_arr = shifted
-
-        # 4. 快速分段与 OVERTRAVEL 过渡线直接挂载 (单循环生成)
-        curr_label = int(seg_labels[0])
-        sub_pts = [refined_pts_arr[0]]
-        sub_start_index = 0
-
-        for i in range(len(seg_labels)):
-            sub_pts.append(refined_pts_arr[i + 1])
-            is_last_step = i == len(seg_labels) - 1
-
-            if is_last_step or seg_labels[i + 1] != curr_label:
-                sub_arr = np.asarray(sub_pts, dtype=float)
-                is_intruded = curr_label > 0
-                region_tag = "CENTER_INTRUDED" if is_intruded else "CENTER"
-                note_tag = seg.note + (" [INTRUDED]" if is_intruded else " [SAFE]")
-
-                if is_intruded:
-                    start_orig = original_refined_pts_arr[sub_start_index]
-                    start_shift = refined_pts_arr[sub_start_index]
-                    if np.linalg.norm(start_orig - start_shift) > 1e-4:
-                        new_trajectory.append(
-                            TrajectorySegment(
-                                kind="OVERTRAVEL",
-                                uv=np.full((2, 2), np.nan),
-                                xyz=np.vstack([start_orig, start_shift]),
-                                spray_on=False,
-                                note="[INTRUSION_ENTRY_CONNECT]",
-                                region="INTRUSION_CONNECT",
-                                phases=np.zeros(2, dtype=int),
-                            )
-                        )
-
-                new_trajectory.append(
-                    TrajectorySegment(
-                        kind="SURFACE_SCAN",
-                        uv=np.full((len(sub_arr), 2), np.nan),
-                        xyz=sub_arr,
-                        spray_on=seg.spray_on,
-                        note=note_tag,
-                        region=region_tag,
-                        phases=np.zeros(len(sub_arr), dtype=int),
-                    )
-                )
-
-                if is_intruded:
-                    end_orig = original_refined_pts_arr[i + 1]
-                    end_shift = refined_pts_arr[i + 1]
-                    if np.linalg.norm(end_orig - end_shift) > 1e-4:
-                        new_trajectory.append(
-                            TrajectorySegment(
-                                kind="OVERTRAVEL",
-                                uv=np.full((2, 2), np.nan),
-                                xyz=np.vstack([end_shift, end_orig]),
-                                spray_on=False,
-                                note="[INTRUSION_EXIT_CONNECT]",
-                                region="INTRUSION_CONNECT",
-                                phases=np.zeros(2, dtype=int),
-                            )
-                        )
-
-                if not is_last_step:
-                    curr_label = int(seg_labels[i + 1])
-                    sub_pts = [refined_pts_arr[i + 1]]
-                    sub_start_index = i + 1
-
-    if debug_intersections:
-        marker_points = np.asarray(debug_intersections, dtype=float)
-        new_trajectory.append(
-            TrajectorySegment(
-                kind="INTERSECTION_MARKER",
-                uv=np.full((len(marker_points), 2), np.nan),
-                xyz=marker_points,
-                spray_on=False,
-                note="[DEBUG intersections]",
-                region="INTERSECTION_MARKER",
-                phases=np.zeros(len(marker_points), dtype=int),
-            )
-        )
-    return new_trajectory
-
-    
 class _UVToXYZMapper:
     def __init__(self, data: ObjUVData):
         from scipy.spatial import cKDTree
@@ -2449,17 +2217,6 @@ def _seam_projection_and_counterpart(
     return np.asarray(best_source, dtype=float), np.asarray(best_point, dtype=float)
 
 
-def _seam_counterpart(
-        point: np.ndarray,
-        seam_segments: Sequence[SeamUVSegment],
-        from_a: bool,
-) -> np.ndarray:
-    _, counterpart = _seam_projection_and_counterpart(
-        point, seam_segments, from_a
-    )
-    return counterpart
-
-
 def _overtravel_segment(
         previous: TrajectorySegment,
         following: TrajectorySegment,
@@ -2489,8 +2246,6 @@ def _overtravel_segment(
         p1 = p0 + handle * exit_direction
         p2 = p3 - handle * entry_direction
         xyz = np.vstack([p0, p1, p2, p3])
-    note = "3D-only opening connector"
-
     return TrajectorySegment(
         kind="OVERTRAVEL",
         uv=np.full((len(xyz), 2), np.nan),
@@ -2520,146 +2275,6 @@ def _rebuild_overtravel_connectors(
     return result
 
 
-def _trim_mapped_segment(
-        segment: TrajectorySegment,
-        distance: float,
-        from_start: bool,
-) -> TrajectorySegment:
-    xyz = np.asarray(segment.xyz, dtype=float)
-    uv = np.asarray(segment.uv, dtype=float)
-    if from_start:
-        reversed_segment = TrajectorySegment(
-            segment.kind, segment.uv[::-1].copy(), segment.xyz[::-1].copy(),
-            segment.spray_on, segment.note,
-        )
-        trimmed = _trim_mapped_segment(reversed_segment, distance, False)
-        return TrajectorySegment(
-            trimmed.kind, trimmed.uv[::-1].copy(), trimmed.xyz[::-1].copy(),
-            trimmed.spray_on, trimmed.note,
-        )
-    if len(xyz) < 2:
-        raise ValueError("A seam-adjacent scan needs at least two 3D points.")
-    edge_lengths = np.linalg.norm(xyz[1:] - xyz[:-1], axis=1)
-    cumulative = np.r_[0.0, np.cumsum(edge_lengths)]
-    total = float(cumulative[-1])
-    target = total - float(distance)
-    if target <= EPS:
-        raise ValueError("The requested 3D seam blend would consume an entire scan.")
-    index = min(int(np.searchsorted(cumulative, target, side="right") - 1), len(xyz) - 2)
-    length = float(edge_lengths[index])
-    ratio = 0.0 if length <= EPS else (target - cumulative[index]) / length
-    xyz_endpoint = xyz[index] + ratio * (xyz[index + 1] - xyz[index])
-    if len(uv) == len(xyz):
-        uv_endpoint = uv[index] + ratio * (uv[index + 1] - uv[index])
-        trimmed_uv = np.vstack([uv[:index + 1], uv_endpoint])
-    else:
-        trimmed_uv = np.full((index + 2, 2), np.nan)
-    return TrajectorySegment(
-        segment.kind,
-        trimmed_uv,
-        np.vstack([xyz[:index + 1], xyz_endpoint]),
-        segment.spray_on,
-        segment.note,
-    )
-
-
-def _cubic_xyz_blend(
-        start: np.ndarray,
-        stop: np.ndarray,
-        start_tangent: np.ndarray,
-        stop_tangent: np.ndarray,
-        nominal_radius: float,
-        sample_step: float,
-) -> np.ndarray:
-    start_tangent = np.asarray(start_tangent, dtype=float)
-    stop_tangent = np.asarray(stop_tangent, dtype=float)
-    start_tangent /= max(float(np.linalg.norm(start_tangent)), EPS)
-    stop_tangent /= max(float(np.linalg.norm(stop_tangent)), EPS)
-    chord = float(np.linalg.norm(stop - start))
-    if chord <= EPS:
-        return np.vstack([start, stop])
-    turn = float(np.arccos(np.clip(np.dot(start_tangent, stop_tangent), -1.0, 1.0)))
-    circular_handle = 4.0 * nominal_radius / 3.0 * np.tan(max(turn, 1.0e-3) / 4.0)
-    handle = min(max(circular_handle, 0.16 * chord), 0.48 * chord)
-    control = np.vstack([
-        start,
-        start + handle * start_tangent,
-        stop - handle * stop_tangent,
-        stop,
-    ])
-    control_length = float(np.sum(np.linalg.norm(control[1:] - control[:-1], axis=1)))
-    count = max(16, int(np.ceil(control_length / sample_step)) + 1)
-    phase = np.linspace(0.0, np.pi, count)
-    parameter = (0.5 - 0.5 * np.cos(phase))[:, None]
-    xyz = ((1.0 - parameter) ** 3 * control[0]
-           + 3.0 * (1.0 - parameter) ** 2 * parameter * control[1]
-           + 3.0 * (1.0 - parameter) * parameter ** 2 * control[2]
-           + parameter ** 3 * control[3])
-    xyz[0] = start
-    xyz[-1] = stop
-    return xyz
-
-
-def _smooth_seam_jumps_xyz(
-        segments: Sequence[TrajectorySegment],
-        nominal_radius: float,
-        sample_step: float,
-) -> list[TrajectorySegment]:
-    result: list[TrajectorySegment] = []
-    index = 0
-    while index < len(segments):
-        if (
-                index + 2 < len(segments)
-                and segments[index].kind == "SURFACE_SCAN"
-                and segments[index + 1].kind == "SEAM_JUMP"
-                and segments[index + 2].kind == "SURFACE_SCAN"
-        ):
-            incoming = segments[index]
-            jump = segments[index + 1]
-            outgoing = segments[index + 2]
-            incoming_length = float(np.sum(np.linalg.norm(
-                incoming.xyz[1:] - incoming.xyz[:-1], axis=1
-            )))
-            outgoing_length = float(np.sum(np.linalg.norm(
-                outgoing.xyz[1:] - outgoing.xyz[:-1], axis=1
-            )))
-            lead = min(nominal_radius, 0.45 * incoming_length, 0.45 * outgoing_length)
-            if Terror := lead <= EPS:
-                result.extend([incoming, jump, outgoing])
-                index += 3
-                continue
-            incoming_trimmed = _trim_mapped_segment(incoming, lead, from_start=False)
-            outgoing_trimmed = _trim_mapped_segment(outgoing, lead, from_start=True)
-            incoming_tangent = incoming_trimmed.xyz[-1] - incoming_trimmed.xyz[-2]
-            outgoing_tangent = outgoing_trimmed.xyz[1] - outgoing_trimmed.xyz[0]
-            blend_xyz = _cubic_xyz_blend(
-                incoming_trimmed.xyz[-1], outgoing_trimmed.xyz[0],
-                incoming_tangent, outgoing_tangent,
-                nominal_radius, sample_step,
-            )
-            marker = TrajectorySegment(
-                "SEAM_JUMP",
-                jump.uv.copy(),
-                np.empty((0, 3), dtype=float),
-                False,
-                jump.note + "; XYZ motion replaced by SEAM_BLEND_3D",
-            )
-            blend = TrajectorySegment(
-                "SEAM_BLEND_3D",
-                np.full((len(blend_xyz), 2), np.nan),
-                blend_xyz,
-                incoming.spray_on and outgoing.spray_on,
-                (f"3D coordinated seam blend; nominal radius={nominal_radius:.12g}; "
-                 f"lead distance={lead:.12g}"),
-            )
-            result.extend([incoming_trimmed, marker, blend, outgoing_trimmed])
-            index += 3
-            continue
-        result.append(segments[index])
-        index += 1
-    return result
-
-
 def _make_surface_scan(
         x_value: float,
         interval: tuple[float, float],
@@ -2681,50 +2296,6 @@ def _make_surface_scan(
     return TrajectorySegment(
         "SURFACE_SCAN", uv, xyz, True, note, region,
         phases=phases  # 传入 phases
-    )
-
-
-def _make_scan_from_seam_destination(
-        destination_uv: np.ndarray,
-        region: str,
-        upward: bool,
-        sample_step: float,
-        frame: PlanningFrame,
-        local_uv: np.ndarray,
-        uv_faces: np.ndarray,
-        tolerance: float,
-        mapper: _UVToXYZMapper,
-        snap_tolerance: float | None = None,
-        note: str = "",
-) -> TrajectorySegment | None:
-    dest_local = _to_local(np.asarray(destination_uv, dtype=float)[None, :], frame)[0]
-    x_val = float(dest_local[0])
-    dest_y = float(dest_local[1])
-
-    all_intervals = _line_domain_intervals(local_uv, uv_faces, x_val, tolerance)
-    if not all_intervals:
-        return None
-    interval = _region_interval(local_uv, uv_faces, x_val, region, tolerance)
-    if interval is None:
-        interval = (
-            min(item[0] for item in all_intervals),
-            max(item[1] for item in all_intervals),
-        )
-
-    low, high = interval
-    if upward:
-        low = float(np.clip(dest_y, low, high))
-    else:
-        high = float(np.clip(dest_y, low, high))
-
-    if abs(high - low) < tolerance:
-        return None
-
-    uv = _sample_scan_uv(x_val, (low, high), upward, sample_step, frame)
-    uv[0] = np.asarray(destination_uv, dtype=float).copy()
-    return TrajectorySegment(
-        "SURFACE_SCAN", uv,
-        mapper.map(uv, snap_tolerance, bridge_outside=True), True, note,
     )
 
 
@@ -2824,50 +2395,6 @@ def smooth_v_trajectory(
 
     return smoothed_xyz
 
-
-def extract_raw_v_trajectories(
-        trajectory: List[TrajectorySegment],
-) -> List[dict]:
-    """
-    第一阶段：提取 LOWER/UPPER 区域的原始 V 形轨迹特征及关键控制点。
-    严格保证 P1(起点)、P3(终点) 作为固定端点，P2 为原始几何尖点。
-    """
-    v_segments = []
-    for seg in trajectory:
-        if seg.kind == "SURFACE_SCAN" and getattr(seg, "region", "") in ("LOWER", "UPPER"):
-            xyz = np.asarray(seg.xyz, dtype=float)
-            if len(xyz) < 3:
-                v_segments.append({"type": "PASSTHROUGH", "seg": seg})
-                continue
-
-            P1 = xyz[0]
-            P3 = xyz[-1]
-            chord_vec = P3 - P1
-            chord_len = np.linalg.norm(chord_vec)
-            if chord_len < 1e-6:
-                v_segments.append({"type": "PASSTHROUGH", "seg": seg})
-                continue
-
-            u_chord = chord_vec / chord_len
-            vecs = xyz - P1
-            proj_lengths = vecs @ u_chord
-            proj_pts = P1 + np.outer(proj_lengths, u_chord)
-            perp_dists = np.linalg.norm(xyz - proj_pts, axis=1)
-            idx_tip = int(np.argmax(perp_dists))
-            P2 = xyz[idx_tip]
-
-            v_segments.append({
-                "type": "V_SHAPE",
-                "seg": seg,
-                "xyz": xyz,
-                "idx_tip": idx_tip,
-                "P1": P1,
-                "P2": P2,
-                "P3": P3,
-            })
-        else:
-            v_segments.append({"type": "PASSTHROUGH", "seg": seg})
-    return v_segments
 
 def extract_raw_v_trajectories(
         trajectory: List[TrajectorySegment],
@@ -3695,47 +3222,6 @@ def _resample_polyline(pts: np.ndarray, step: float) -> np.ndarray:
     return out
 
 
-def _void_centers(
-        tri_centers: np.ndarray,
-        fixed_pts: np.ndarray,
-        center_pts: np.ndarray,
-        d: float,
-        n_centers: int = 2,
-) -> tuple:
-    """自动定位 mesh 上最大的 n_centers 个空白区中心。
-    与部件朝向、圆弧区域存在几个均无关。
-    返回 (centers, max_void_depth)；max_void_depth 用于判断是否存在大空白（缺弧）。"""
-    from scipy.spatial import cKDTree
-    all_pts = np.vstack([fixed_pts, center_pts]) if len(fixed_pts) else center_pts
-    dist, _ = cKDTree(all_pts).query(tri_centers)
-
-    void_mask = dist > 0.6 * d
-    void_pts = tri_centers[void_mask]
-    void_w = dist[void_mask] - 0.6 * d
-    if len(void_pts) == 0:
-        return [], 0.0  # 【鲁棒性3】：无空白 -> 空列表 + 深度 0
-    max_void_depth = float(void_w.max())
-
-    order = np.argsort(void_w)[::-1]
-    seeds = []
-    for idx in order:
-        c = void_pts[idx]
-        if all(float(np.linalg.norm(c - s)) > 3.0 * d for s in seeds):
-            seeds.append(c)
-        if len(seeds) == n_centers:
-            break
-
-    centers = []
-    for s in seeds:
-        local = np.linalg.norm(void_pts - s, axis=1) <= 1.5 * d
-        if np.any(local):
-            w = np.maximum(void_w[local], 1e-6)
-            centers.append((void_pts[local] * w[:, None]).sum(axis=0) / w.sum())
-        else:
-            centers.append(s)
-    return centers, max_void_depth
-
-
 def _trajectory_objective(
         tri_centers: np.ndarray,
         fixed_pts: np.ndarray,
@@ -3745,6 +3231,7 @@ def _trajectory_objective(
         spacing_weight: float,
         boundary_weight: float,
         smooth_weight: float,
+        radial_barriers: Sequence[dict[str, object]] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Evaluate one fixed, dimensionless trajectory-quality objective.
 
@@ -3774,8 +3261,13 @@ def _trajectory_objective(
     else:
         spacing_loss = 0.0
 
-    # CENTER paths must not enter the protected LOWER/UPPER arc zone.
-    if len(fixed_pts):
+    # Use the same non-uniform radial barrier as the actual CENTER update.
+    if radial_barriers:
+        barrier_force, _, _, _, _ = _radial_barrier_state(
+            center_pts, radial_barriers, d, stiffness=1.0
+        )
+        boundary_loss = float(np.mean(np.linalg.norm(barrier_force, axis=1) ** 2))
+    elif len(fixed_pts):
         boundary_distance, _ = cKDTree(fixed_pts).query(center_pts)
         boundary_residual = np.maximum(1.15 - boundary_distance / d, 0.0)
         boundary_loss = float(np.mean(boundary_residual ** 2))
@@ -3823,6 +3315,179 @@ def _fixed_spline_samples(
     return np.vstack(samples) if samples else np.empty((0, 3), dtype=float)
 
 
+def _smooth_linewise_vectors(
+    vectors: np.ndarray,
+    offsets: np.ndarray,
+    passes: int = 2,
+    radius: int = 2,
+) -> np.ndarray:
+    """Low-pass a vector field independently along each trajectory."""
+    result = np.asarray(vectors, dtype=float).copy()
+    radius = max(1, int(radius))
+    samples = np.arange(-radius, radius + 1, dtype=float)
+    sigma = max(1.0, 0.5 * radius)
+    kernel = np.exp(-0.5 * (samples / sigma) ** 2)
+    kernel /= float(np.sum(kernel))
+    for _ in range(max(0, int(passes))):
+        previous = result.copy()
+        for line_index in range(len(offsets) - 1):
+            start, stop = int(offsets[line_index]), int(offsets[line_index + 1])
+            if stop - start < len(kernel):
+                continue
+            padded = np.pad(
+                previous[start:stop], ((radius, radius), (0, 0)), mode="edge"
+            )
+            for axis in range(3):
+                result[start:stop, axis] = np.convolve(
+                    padded[:, axis], kernel, mode="valid"
+                )
+    return result
+
+
+def _directed_pair_force(
+    follower: np.ndarray,
+    leader: np.ndarray,
+    spacing: float,
+    attract_weight: float,
+    repel_weight: float,
+    gain: float = 1.0,
+) -> np.ndarray:
+    """Return a d-equilibrium force applied only to the follower line."""
+    follower = np.asarray(follower, dtype=float)
+    leader = np.asarray(leader, dtype=float)
+    force = np.zeros_like(follower)
+    if not len(follower) or not len(leader):
+        return force
+    distance, nearest = cKDTree(leader).query(follower)
+    active = distance > 1.0e-6
+    if not np.any(active):
+        return force
+    d = max(float(spacing), EPS)
+    gap = distance[active]
+    delta = follower[active] - leader[nearest[active]]
+    direction = delta / gap[:, None]
+    error = (gap - d) / d
+    dead = np.clip(np.abs(error) / 0.04, 0.0, 1.0)
+    dead = dead * dead * (3.0 - 2.0 * dead)
+    magnitude = np.where(
+        gap < d,
+        repel_weight * np.minimum(d / gap - 1.0, 4.0),
+        -attract_weight * np.minimum(gap / d - 1.0, 1.0),
+    ) * dead * float(gain)
+    force[active] = direction * magnitude[:, None]
+    return force
+
+
+def _blank_guidance_force(
+    points: np.ndarray,
+    centers: Sequence[np.ndarray],
+    spacing: float,
+    influence_radius: float,
+    gain: float,
+) -> np.ndarray:
+    """Long-range guidance that fades smoothly as points reach a blank center."""
+    points = np.asarray(points, dtype=float)
+    force = np.zeros_like(points)
+    d = max(float(spacing), EPS)
+    response_radius = max(float(influence_radius), 0.75 * d, EPS)
+    dead_radius = 0.5 * d
+    for center in centers:
+        delta = np.asarray(center, dtype=float) - points
+        distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-8)
+        response_t = np.clip(
+            (distance - dead_radius)
+            / max(response_radius - dead_radius, EPS),
+            0.0,
+            1.0,
+        )
+        response = response_t ** 2 * (3.0 - 2.0 * response_t)
+        force += (
+            float(gain) * response
+        )[:, None] * (delta / distance[:, None])
+    return force
+
+
+def _remove_leader_gap_components(
+    force: np.ndarray,
+    points: np.ndarray,
+    offsets: np.ndarray,
+) -> None:
+    """Prevent guidance force from changing the C0/C_last separation."""
+    if len(offsets) < 3:
+        return
+    first_start, first_stop = int(offsets[0]), int(offsets[1])
+    last_start, last_stop = int(offsets[-2]), int(offsets[-1])
+    first = points[first_start:first_stop]
+    last = points[last_start:last_stop]
+    if not len(first) or not len(last):
+        return
+
+    _, nearest_last = cKDTree(last).query(first)
+    first_normal = first - last[nearest_last]
+    first_norm = np.linalg.norm(first_normal, axis=1)
+    valid_first = first_norm > 1.0e-8
+    first_normal[valid_first] /= first_norm[valid_first, None]
+    first_force = force[first_start:first_stop]
+    first_component = np.einsum("ij,ij->i", first_force, first_normal)
+    first_force[valid_first] -= (
+        first_component[valid_first, None] * first_normal[valid_first]
+    )
+
+    _, nearest_first = cKDTree(first).query(last)
+    last_normal = last - first[nearest_first]
+    last_norm = np.linalg.norm(last_normal, axis=1)
+    valid_last = last_norm > 1.0e-8
+    last_normal[valid_last] /= last_norm[valid_last, None]
+    last_force = force[last_start:last_stop]
+    last_component = np.einsum("ij,ij->i", last_force, last_normal)
+    last_force[valid_last] -= (
+        last_component[valid_last, None] * last_normal[valid_last]
+    )
+
+
+def _prioritize_leader_gap_displacement(
+    displacement: np.ndarray,
+    base_displacement: np.ndarray,
+    points: np.ndarray,
+    offsets: np.ndarray,
+    step_cap: np.ndarray,
+) -> None:
+    """Reserve leader normal motion for non-blank forces; fit guidance tangentially."""
+    if len(offsets) < 3:
+        return
+    first_start, first_stop = int(offsets[0]), int(offsets[1])
+    last_start, last_stop = int(offsets[-2]), int(offsets[-1])
+    first = points[first_start:first_stop]
+    last = points[last_start:last_stop]
+
+    def enforce(start: int, stop: int, normal: np.ndarray) -> None:
+        normal_norm = np.linalg.norm(normal, axis=1)
+        valid = normal_norm > 1.0e-8
+        normal[valid] /= normal_norm[valid, None]
+        target = displacement[start:stop]
+        base = base_displacement[start:stop]
+        cap = np.asarray(step_cap[start:stop], dtype=float)
+        target_normal = np.einsum("ij,ij->i", target, normal)
+        desired_normal = np.clip(
+            np.einsum("ij,ij->i", base, normal), -cap, cap
+        )
+        tangent = target - target_normal[:, None] * normal
+        tangent_norm = np.linalg.norm(tangent, axis=1)
+        tangent_limit = np.sqrt(np.maximum(cap ** 2 - desired_normal ** 2, 0.0))
+        tangent_scale = np.minimum(
+            1.0, tangent_limit / np.maximum(tangent_norm, 1.0e-12)
+        )
+        target[valid] = (
+            tangent[valid] * tangent_scale[valid, None]
+            + desired_normal[valid, None] * normal[valid]
+        )
+
+    _, nearest_last = cKDTree(last).query(first)
+    enforce(first_start, first_stop, first - last[nearest_last])
+    _, nearest_first = cKDTree(first).query(last)
+    enforce(last_start, last_stop, last - first[nearest_first])
+
+
 def _optimize_trajectory_region_energy(
         trajectory: List[TrajectorySegment],
         mesh: trimesh.Trimesh,
@@ -3831,15 +3496,15 @@ def _optimize_trajectory_region_energy(
         attract_weight: float = 0.35,  # 空白区引导引力
         self_repel_weight: float = 0.30,  # 线上节点互斥力
         arc_repel_weight: float = 3.50,  # 固定样条边界排斥权重（保留参数名以兼容旧调用）
-        elastic_weight: float = 0.10,  # 顺向平滑刚度
+        elastic_weight: float = 0.35,  # 顺向平滑刚度
         transverse_weight: float = 0.60,  # 跨线 Δ 变动均摊刚度
         pair_attract_weight: float = 6.00,
         pair_repel_weight: float = 6.00,
         target_spacing: float = 30.0,
         sample_step: float | None = None,
         influence_radius: float | None = None,
-        recompute_blank_every: int = 6,
-        resample_every: int = 3,
+        blank_centers_3d: dict[str, Sequence[float]] | None = None,
+        periodic_pair_blocked: bool | None = None,
         anneal: float = 0.96,
 
         # =========================
@@ -3980,8 +3645,34 @@ def _optimize_trajectory_region_energy(
         else:
             locked_masks.append(np.zeros(len(line), dtype=bool))
     fixed_pts = _fixed_spline_samples(trajectory, fixed_idx, step0)
-    coverage_reference_pts = fixed_pts
     fixed_tree = cKDTree(fixed_pts) if len(fixed_pts) else None
+    radial_barriers: list[dict[str, object]] = []
+    if moving_region == "CENTER":
+        hard_boundary_indices = []
+        if lower_idx:
+            hard_boundary_indices.append(("LOWER", lower_idx[-1]))
+        if upper_idx:
+            hard_boundary_indices.append(("UPPER", upper_idx[0]))
+        for side, boundary_index in hard_boundary_indices:
+            raw_boundary_points = np.asarray(
+                trajectory[boundary_index].xyz, float
+            )
+            boundary_points = _resample_polyline(
+                raw_boundary_points, step0
+            )
+            if len(boundary_points) < 2:
+                continue
+            center = _project_to_mesh(
+                mesh, _closed_polyline_center(raw_boundary_points)
+            )
+            if center is None:
+                continue
+            radial_barriers.append({
+                "side": side,
+                "center": center,
+                "points": boundary_points,
+                "tree": cKDTree(boundary_points),
+            })
     print(
         f"[Energy optimizer] region={moving_region}, movable_paths={len(moving_idx)}, "
         f"arc_anchors={len(fixed_pts)}, iterations={iterations}, d={d:.6g}",
@@ -3991,6 +3682,11 @@ def _optimize_trajectory_region_energy(
     initial_line_trees = [cKDTree(line) for line in lines]
     endpoints = [(L[0].copy(), L[-1].copy()) for L in lines]
     num_lines = len(lines)
+    middle_anchor_index = (
+        num_lines // 2
+        if moving_region == "CENTER" and num_lines >= 3 and num_lines % 2 == 1
+        else None
+    )
 
     # =========================================================
     # 新增：用于均匀性判断的固定喷涂点、顶点树、顶点面积权重
@@ -4141,7 +3837,41 @@ def _optimize_trajectory_region_energy(
     last_uniform_threshold = float("nan")
     stop_reason = None
 
-    blanks, void_depth = [], 0.0
+    blanks: list[np.ndarray] = []
+    void_depth = 0.0
+    if moving_region == "CENTER":
+        center_geometry = None
+        if blank_centers_3d is None or periodic_pair_blocked is None:
+            center_geometry = _special_boundary_geometry(
+                trajectory, d, mesh=mesh
+            )
+        fixed_blank_centers = blank_centers_3d
+        if fixed_blank_centers is None:
+            fixed_blank_centers = center_geometry.get(
+                "blank_centers_3d", {}
+            )
+        if periodic_pair_blocked is None:
+            periodic_pair_blocked = any(
+                record.get("kind") == "MODEL_BOUNDARY"
+                for record in center_geometry.get("connector_records", [])
+            )
+        if isinstance(fixed_blank_centers, dict):
+            for side in ("LOWER", "UPPER"):
+                value = fixed_blank_centers.get(side)
+                if value is None:
+                    continue
+                point = np.asarray(value, dtype=float)
+                if point.shape == (3,) and np.isfinite(point).all():
+                    blanks.append(point)
+        if blanks:
+            initial_coverage = np.vstack(
+                [fixed_pts, np.vstack(lines)] if len(fixed_pts) else lines
+            )
+            if len(initial_coverage):
+                void_depth = float(np.max(
+                    cKDTree(initial_coverage).query(np.asarray(blanks))[0]
+                ))
+    periodic_pair_blocked = bool(periodic_pair_blocked)
 
     for it in range(iterations):
         P = np.vstack(lines)
@@ -4154,14 +3884,10 @@ def _optimize_trajectory_region_energy(
         moving_point = np.ones(len(P), dtype=bool)
         if moving_region != "CENTER":
             moving_point = ~np.concatenate(locked_masks)
-
-        if it % recompute_blank_every == 0:
-            # Coverage targets are determined by CENTER and the fixed arc
-            # anchors only.  LOWER/UPPER straight portions may follow later,
-            # but must not hide a blank from the fast CENTER optimizer.
-            blanks, void_depth = _void_centers(
-                tri_centers, coverage_reference_pts, P, d
-            )
+        elif middle_anchor_index is not None:
+            anchor_start = int(offsets[middle_anchor_index])
+            anchor_stop = int(offsets[middle_anchor_index + 1])
+            moving_point[anchor_start:anchor_stop] = False
 
         large_void = void_depth > 1.2 * d
         R = float(influence_radius) if influence_radius is not None \
@@ -4174,14 +3900,18 @@ def _optimize_trajectory_region_energy(
 
         # --- A. 空白区引导引力 ---
         if moving_region == "CENTER":
-            # Blank attraction is a CENTER-only coverage force.  Its gain and
-            # radius increase smoothly with the measured void depth.
-            void_gain = attract_weight * (1.0 + np.clip(void_depth / max(d, EPS), 0.0, 4.0) ** 1.35)
-            for c in blanks:
-                dvec = c - P
-                dist = np.maximum(np.linalg.norm(dvec, axis=1), 1e-6)
-                gate = np.clip(1.0 - (dist / R) ** 2, 0.0, 1.0) ** 2
-                void_force += (void_gain * gate)[:, None] * (dvec / dist[:, None])
+            # Each CENTER point owns its distance response.  Points inside
+            # 0.5d have no void force; a nearby point must not disable the
+            # long-range guidance acting on farther points.
+            depth_excess = np.clip(
+                (void_depth - 0.75 * d) / max(d, EPS), 0.0, 3.0
+            )
+            void_gain = (
+                attract_weight * (1.0 + depth_excess ** 1.2)
+            )
+            void_force = _blank_guidance_force(
+                P, blanks, d, R, void_gain
+            )
 
         # The selected red paths form a spring chain ordered far-to-near from
         # CENTER.  Line 0 is the outer reference; each progressively closer
@@ -4218,12 +3948,10 @@ def _optimize_trajectory_region_energy(
 
         tc = cKDTree(P)
 
-        # --- B. 已拟合固定样条的边界势能 ---
-        # E_boundary = mean(max(1.15*d - dist(P, spline), 0)^2 / d^2).
-        # 最近点距离与其梯度对任意样条形状都成立，覆盖直线、圆弧及两者
-        # 的连续过渡，而不再假定 LOWER/UPPER 是半圆。
-        boundary_follow_force = np.zeros_like(F)
-        if fixed_tree is not None:
+        # --- B. Legacy fixed-reference force for red-path relaxation. ---
+        # CENTER bypasses this soft nearest-point field and receives the
+        # radial hard barrier after all ordinary forces are assembled.
+        if fixed_tree is not None and moving_region != "CENTER":
             boundary_clearance = 1.15 * d
             boundary_distance, nearest = fixed_tree.query(
                 P, distance_upper_bound=boundary_clearance
@@ -4246,30 +3974,16 @@ def _optimize_trajectory_region_energy(
                         away[nonzero] / away_norm[nonzero, None] * magnitude[:, None]
                     )
 
-        F += boundary_follow_force
-
         # --- C. 同线与局部节点自排斥力 ---
         coo = tc.sparse_distance_matrix(tc, 1.8 * d, output_type="coo_matrix")
         r_, c_, dv = coo.row, coo.col, coo.data
         ok = (dv > 1e-6) & (r_ != c_)
         same = line_id[r_] == line_id[c_]
         ok &= ~(same & (np.abs(local_id[r_] - local_id[c_]) <= win))
-        # Cross-track spacing is handled only by the d-equilibrium pair
-        # spring above.  Do not add a second always-repulsive force here.
-        if moving_region != "CENTER":
-            ok &= same
-        # Non-local trajectories must not repel each other directly in the
-        # existing UPPER relaxation. CENTER follows Aeigenopt and permits
-        # cross-track repulsion within its own batch.
-        cross_line = (~same) & (moving_region != "CENTER")
-        if np.any(cross_line):
-            linked = np.fromiter(
-                (tuple(sorted((int(line_id[a]), int(line_id[b])))) in neighbour_links
-                 for a, b in zip(r_[cross_line], c_[cross_line])),
-                dtype=bool,
-                count=int(np.count_nonzero(cross_line)),
-            )
-            ok[cross_line] &= linked
+        # Cross-line interaction belongs exclusively to the directed Fpair
+        # chain below. Self-repulsion is local to one trajectory, so an inner
+        # follower can never push force back into C0 or C_last.
+        ok &= same
         r_, c_, dv = r_[ok], c_[ok], dv[ok]
         mag = self_repel_weight * (1.0 - dv / (1.8 * d))
         np.add.at(F, c_, (P[c_] - P[r_]) / dv[:, None] * mag[:, None])
@@ -4280,76 +3994,89 @@ def _optimize_trajectory_region_energy(
             if b - a > 2:
                 F[a + 1:b - 1] += elastic_weight * (P[a:b - 2] - 2 * P[a + 1:b - 1] + P[a + 2:b])
 
-        # --- E. 跨线网格调和中点场 ---
-        # Do not use list-order midpoint forces: list order is not spatial
-        # adjacency for LOWER/CENTER/UPPER trajectories.
+        # --- E. Directed asymmetric CENTER coupling (Fpair). ---
         if moving_region == "CENTER" and num_lines >= 2:
-            line_kdtrees = [cKDTree(L) for L in lines]
-
-            # CENTER is an ordered elastic chain with equilibrium gap d. The
-            # symmetric weights keep the odd middle line fixed and split the
-            # even middle step equally between its two central lines.
-            middle = 0.5 * (num_lines - 1)
-            chain_weights = np.abs(np.arange(num_lines, dtype=float) - middle)
-            if num_lines % 2 == 1:
-                chain_weights[int(middle)] = 0.0
-            if np.max(chain_weights) > 0.0:
-                chain_weights /= np.max(chain_weights)
-            for li in range(num_lines - 1):
-                lj = li + 1
-                a, b = int(offsets[li]), int(offsets[li + 1])
-                _, near = line_kdtrees[lj].query(P[a:b])
-                delta = P[a:b] - lines[lj][near]
-                gap = np.maximum(np.linalg.norm(delta, axis=1), 1e-6)
-                error = (gap - d) / max(d, EPS)
-                dead = np.clip(np.abs(error) / 0.04, 0.0, 1.0)
-                dead = dead * dead * (3.0 - 2.0 * dead)
-                spring = -transverse_weight * error * dead
-                F[a:b] += chain_weights[li] * spring[:, None] * delta / gap[:, None]
-                np.add.at(
-                    F, offsets[lj] + near,
-                    -chain_weights[lj] * spring[:, None] * delta / gap[:, None],
+            def apply_follower(follower_index: int, leader_index: int, gain: float = 1.0) -> None:
+                start, stop = int(offsets[follower_index]), int(offsets[follower_index + 1])
+                F[start:stop] += _directed_pair_force(
+                    P[start:stop],
+                    lines[leader_index],
+                    d,
+                    pair_attract_weight,
+                    pair_repel_weight,
+                    gain=transverse_weight * gain,
                 )
 
-            for li in range(1, num_lines - 1):
-                a, b = int(offsets[li]), int(offsets[li + 1])
-                curr_L = P[a:b]
+            # C0 and C_last are co-leaders. A direct model-boundary connector
+            # blocks their periodic interaction and is treated as infinite gap.
+            if not periodic_pair_blocked:
+                apply_follower(0, num_lines - 1)
+                apply_follower(num_lines - 1, 0)
 
-                _, idx_prev = line_kdtrees[li - 1].query(curr_L)
-                _, idx_next = line_kdtrees[li + 1].query(curr_L)
+            anchor_indices = {0, num_lines - 1}
+            if middle_anchor_index is not None:
+                anchor_indices.add(middle_anchor_index)
 
-                pt_prev = lines[li - 1][idx_prev]
-                pt_next = lines[li + 1][idx_next]
+            # Every non-anchor line balances its own two gaps. A large gap
+            # attracts it toward that side; a compressed gap repels it. The
+            # force is never written into either neighbour, so the three
+            # anchors cannot receive feedback from followers.
+            for follower in range(1, num_lines - 1):
+                if follower in anchor_indices:
+                    continue
+                apply_follower(follower, follower - 1, gain=0.5)
+                apply_follower(follower, follower + 1, gain=0.5)
 
-                mid_target = 0.5 * (pt_prev + pt_next)
-                F[a:b] += transverse_weight * (mid_target - curr_L)
+        # Smooth both ordinary forces and green-center attraction. Previously
+        # the latter bypassed smoothing and created pointwise kinks.
+        force_smoothing_radius = max(2, int(np.ceil(d / step0)))
+        displacement_smoothing_radius = max(
+            force_smoothing_radius, int(np.ceil(1.5 * d / step0))
+        )
+        F = _smooth_linewise_vectors(
+            F, offsets, passes=2, radius=force_smoothing_radius
+        )
+        if moving_region == "CENTER":
+            void_force = _smooth_linewise_vectors(
+                void_force,
+                offsets,
+                passes=2,
+                radius=displacement_smoothing_radius,
+            )
+            _remove_leader_gap_components(
+                void_force, P, offsets
+            )
 
-            # 首尾轨迹线的软约束
-            a0, b0 = int(offsets[0]), int(offsets[1])
-            _, idx1 = line_kdtrees[1].query(P[a0:b0])
-            pt1 = lines[1][idx1]
-            d_vec0 = P[a0:b0] - pt1
-            dist0 = np.maximum(np.linalg.norm(d_vec0, axis=1), 1e-6)
-            F[a0:b0] -= 0.08 * transverse_weight * ((dist0 - d) / d)[:, None] * (d_vec0 / dist0[:, None])
+        # --- F. High-priority radial hard barrier for CENTER. ---
+        barrier_force = np.zeros_like(F)
+        barrier_direction = np.zeros_like(F)
+        barrier_danger = np.zeros(len(P), dtype=bool)
+        barrier_inside = np.zeros(len(P), dtype=bool)
+        escape_step = np.zeros(len(P), dtype=float)
+        if moving_region == "CENTER" and radial_barriers:
+            (
+                barrier_force,
+                barrier_direction,
+                barrier_danger,
+                barrier_inside,
+                escape_step,
+            ) = _radial_barrier_state(
+                P, radial_barriers, d, arc_repel_weight
+            )
+            barrier_danger &= moving_point
+            barrier_inside &= moving_point
+            escape_step[~moving_point] = 0.0
 
-            if num_lines >= 3:
-                an, bn = int(offsets[num_lines - 1]), int(offsets[num_lines])
-                _, idx_prev_n = line_kdtrees[num_lines - 2].query(P[an:bn])
-                pt_prev_n = lines[num_lines - 2][idx_prev_n]
-                d_vecn = P[an:bn] - pt_prev_n
-                distn = np.maximum(np.linalg.norm(d_vecn, axis=1), 1e-6)
-                F[an:bn] -= 0.08 * transverse_weight * ((distn - d) / d)[:, None] * (d_vecn / distn[:, None])
+            inward_component = np.einsum("ij,ij->i", F, barrier_direction)
+            remove_inward = barrier_danger & (inward_component < 0.0)
+            F[remove_inward] -= (
+                inward_component[remove_inward, None]
+                * barrier_direction[remove_inward]
+            )
+            void_force[barrier_danger] = 0.0
+            F += barrier_force
 
-        # Smooth the force field along each scan line to suppress mesh-facet
-        # noise without freezing nodes that have reached the deadband.
-        for li in range(num_lines):
-            a, b = int(offsets[li]), int(offsets[li + 1])
-            if b - a >= 5:
-                raw = F[a:b].copy()
-                for axis in range(3):
-                    F[a:b, axis] = np.convolve(raw[:, axis], [0.2, 0.6, 0.2], mode="same")
-
-        # --- F. 位移上限控制与退火 ---
+        # --- G. Displacement caps and annealing. ---
         # A small relaxation step prevents a compressed pair from jumping
         # across its d-equilibrium in one iteration.
         # Dampen LOWER/UPPER motion as each pair approaches its d equilibrium.
@@ -4385,6 +4112,8 @@ def _optimize_trajectory_region_energy(
                 a, b = int(offsets[li]), int(offsets[li + 1])
                 response = np.where(locked_masks[li], 0.0, 0.75)
                 F[a:b] *= response[:, None]
+        F[~moving_point] = 0.0
+        void_force[~moving_point] = 0.0
         center_force = F + void_force if moving_region == "CENTER" else F
         # Force-based progress metric: sum of the Euclidean magnitudes of
         # the forces actually applied to all nodes in this regional pass.
@@ -4396,11 +4125,102 @@ def _optimize_trajectory_region_energy(
         center_norm = np.maximum(np.linalg.norm(center_force, axis=1), 1e-12)
         center_step = (np.full(len(P), fast_step)
                        if moving_region == "CENTER" else slow_step)
-        P += center_force * np.clip(center_step / center_norm, 0.0, 1.0)[:, None]
+        if moving_region == "CENTER" and np.any(barrier_danger):
+            center_step[barrier_danger] = escape_step[barrier_danger]
+        base_norm = np.maximum(np.linalg.norm(F, axis=1), 1.0e-12)
+        base_displacement = F * np.clip(
+            center_step / base_norm, 0.0, 1.0
+        )[:, None]
+        raw_displacement = center_force * np.clip(
+            center_step / center_norm, 0.0, 1.0
+        )[:, None]
+        base_displacement[~moving_point] = 0.0
+        raw_displacement[~moving_point] = 0.0
+        for li in range(num_lines):
+            a, b = int(offsets[li]), int(offsets[li + 1])
+            base_displacement[a] = 0.0
+            base_displacement[b - 1] = 0.0
+            raw_displacement[a] = 0.0
+            raw_displacement[b - 1] = 0.0
 
-        track_norm = np.maximum(np.linalg.norm(F, axis=1), 1e-12)
-        track_step = np.zeros(len(P), dtype=float)
-        P += F * np.clip(track_step / track_norm, 0.0, 1.0)[:, None]
+        smoothed_base_displacement = _smooth_linewise_vectors(
+            base_displacement,
+            offsets,
+            passes=2 if moving_region == "CENTER" else 1,
+            radius=(
+                displacement_smoothing_radius
+                if moving_region == "CENTER"
+                else force_smoothing_radius
+            ),
+        )
+        displacement = _smooth_linewise_vectors(
+            raw_displacement,
+            offsets,
+            passes=2 if moving_region == "CENTER" else 1,
+            radius=(
+                displacement_smoothing_radius
+                if moving_region == "CENTER"
+                else force_smoothing_radius
+            ),
+        )
+        displacement[~moving_point] = 0.0
+        for li in range(num_lines):
+            a, b = int(offsets[li]), int(offsets[li + 1])
+            displacement[a] = 0.0
+            displacement[b - 1] = 0.0
+
+        # Smoothing must not erase the hard barrier's escape component.
+        if moving_region == "CENTER" and np.any(barrier_danger):
+            raw_outward = np.einsum(
+                "ij,ij->i", raw_displacement, barrier_direction
+            )
+            smooth_outward = np.einsum(
+                "ij,ij->i", displacement, barrier_direction
+            )
+            required_outward = 0.75 * np.maximum(raw_outward, 0.0)
+            restore = barrier_danger & (smooth_outward < required_outward)
+            displacement[restore] += (
+                (required_outward[restore] - smooth_outward[restore])[:, None]
+                * barrier_direction[restore]
+            )
+
+        displacement_norm = np.maximum(
+            np.linalg.norm(displacement, axis=1), 1.0e-12
+        )
+        displacement *= np.clip(
+            center_step / displacement_norm, 0.0, 1.0
+        )[:, None]
+        if moving_region == "CENTER" and num_lines >= 2:
+            _prioritize_leader_gap_displacement(
+                displacement,
+                smoothed_base_displacement,
+                P,
+                offsets,
+                center_step,
+            )
+        P += displacement
+
+        # Remove accumulated geometric kinks before the single mesh
+        # projection. Hard-barrier nodes and immutable arc samples remain
+        # untouched; their neighbours fair toward them smoothly.
+        fairing_locked = (~moving_point) | barrier_danger
+        for li in range(num_lines):
+            a, b = int(offsets[li]), int(offsets[li + 1])
+            fairing_locked[a] = True
+            fairing_locked[b - 1] = True
+        for _ in range(2 if moving_region == "CENTER" else 1):
+            previous = P.copy()
+            for li in range(num_lines):
+                a, b = int(offsets[li]), int(offsets[li + 1])
+                if b - a > 2:
+                    laplacian = (
+                        0.5 * (previous[a:b - 2] + previous[a + 2:b])
+                        - previous[a + 1:b - 1]
+                    )
+                    P[a + 1:b - 1] = (
+                        previous[a + 1:b - 1] + 0.45 * laplacian
+                    )
+            P[fairing_locked] = previous[fairing_locked]
 
         # 投影回 3D 曲面 + 钉死端点
         P, _, _ = trimesh.proximity.closest_point(mesh, P)
@@ -4411,6 +4231,8 @@ def _optimize_trajectory_region_energy(
             L[0], L[-1] = endpoints[li]
             # Arc/fillet geometry is immutable during spacing relaxation.
             L[locked_masks[li]] = lines[li][locked_masks[li]]
+            if middle_anchor_index is not None and li == middle_anchor_index:
+                L = lines[li].copy()
             new_lines.append(L)
         lines = new_lines
 
@@ -4558,11 +4380,15 @@ def _optimize_trajectory_region_energy(
                 spacing_weight=self_repel_weight + transverse_weight,
                 boundary_weight=arc_repel_weight,
                 smooth_weight=elastic_weight,
+                radial_barriers=radial_barriers,
             )
             energy_components = dict(energy_components)
             energy_components["force_total"] = force_total
             energy_components["force_mean"] = force_mean
             energy_components["force_max"] = force_max
+            energy_components["boundary_danger_count"] = int(np.count_nonzero(barrier_danger))
+            energy_components["boundary_inside_count"] = int(np.count_nonzero(barrier_inside))
+            energy_components["boundary_escape_step_max"] = float(np.max(escape_step)) if len(escape_step) else 0.0
             displacement = np.concatenate([
                 initial_line_trees[k].query(line)[0]
                 for k, line in enumerate(lines)
@@ -4656,6 +4482,7 @@ def optimize_center_trajectories_dual_blank_energy(
     on_iteration = kwargs.pop("on_iteration", None)
     iterations = int(kwargs.get("iterations", 140))
     target_spacing = float(kwargs.get("target_spacing", 30.0))
+    current_blank_centers = kwargs.pop("blank_centers_3d", None)
 
     # The stop test applies to the red tracks that are actually allowed to
     # move, not to the permanently fixed outer tracks.
@@ -4682,6 +4509,19 @@ def optimize_center_trajectories_dual_blank_energy(
     # force field and treats the other region as a fixed boundary.
     center_result = list(trajectory)
     upper_result = list(trajectory)
+    initial_blank_geometry = _special_boundary_geometry(
+        trajectory, target_spacing, mesh=mesh
+    )
+    if current_blank_centers is None:
+        current_blank_centers = dict(
+            initial_blank_geometry.get("blank_centers_3d", {})
+        )
+    else:
+        current_blank_centers = dict(current_blank_centers)
+    current_periodic_blocked = any(
+        record.get("kind") == "MODEL_BOUNDARY"
+        for record in initial_blank_geometry.get("connector_records", [])
+    )
     step_kwargs = dict(kwargs)
     step_kwargs.update({
         "iterations": 1,
@@ -4712,6 +4552,8 @@ def optimize_center_trajectories_dual_blank_energy(
             metric_state["energy"] += float(_energy)
             metric_state.update(components)
 
+        step_kwargs["blank_centers_3d"] = current_blank_centers
+        step_kwargs["periodic_pair_blocked"] = current_periodic_blocked
         step_kwargs["on_iteration"] = capture
         center_result = _optimize_trajectory_region_energy(
             trajectory=upper_result,
@@ -4736,6 +4578,29 @@ def optimize_center_trajectories_dual_blank_energy(
             # Keep the red trajectories frozen while CENTER continues its
             # independent Aeigenopt-style coverage relaxation.
             upper_result = center_result
+
+        latest_blank_geometry = _special_boundary_geometry(
+            upper_result, target_spacing, mesh=mesh
+        )
+        # Eligibility controls whether a side may update its void center, not
+        # whether an already established center still exists.  Keep the last
+        # valid point when the live C0/C_last gaps later fall below 1.5d so
+        # rendering and the next force step consume the same persistent state.
+        latest_blank_centers = latest_blank_geometry.get(
+            "blank_centers_3d", {}
+        )
+        if isinstance(latest_blank_centers, dict):
+            for side in ("LOWER", "UPPER"):
+                value = latest_blank_centers.get(side)
+                if value is None:
+                    continue
+                point = np.asarray(value, dtype=float)
+                if point.shape == (3,) and np.isfinite(point).all():
+                    current_blank_centers[side] = point.tolist()
+        current_periodic_blocked = any(
+            record.get("kind") == "MODEL_BOUNDARY"
+            for record in latest_blank_geometry.get("connector_records", [])
+        )
         if on_iteration is not None:
             moved = []
             for before, after in zip(trajectory, upper_result):
@@ -4802,6 +4667,8 @@ def optimize_center_trajectories_dual_blank_energy(
                     "center_displacement_max": motion_metric,
                     "outer_gap": float(outer_gap) if 'outer_gap' in locals() else float("inf"),
                     "red_motion_active": float(red_motion_active),
+                    "blank_centers_3d": current_blank_centers,
+                    "periodic_pair_blocked": current_periodic_blocked,
                 },
                 )
 
@@ -4846,8 +4713,8 @@ def optimize_trajectory_arcs_postprocess(
         trajectory: List[TrajectorySegment],
         mesh: trimesh.Trimesh,
         speed: float = 300.0,
-        a_max: float = DEFAULT_A_MAX,
-        j_max: float = DEFAULT_J_MAX,
+        a_max: float = 1000.0,
+        j_max: float = 5000.0,
         target_spacing: float = 30.0,
         sample_step: float = 1.0,
         center_boundary_limit: float | None = None,
@@ -5179,20 +5046,6 @@ def generate_seam_aware_trajectory(
         segments.append(segment)
         last_surface = segment
 
-    # 切缝连接
-    def append_jump(source_uv: np.ndarray, from_a: bool) -> np.ndarray:
-        destination_uv = _seam_counterpart(source_uv, seam_segments, from_a=from_a)
-        jump_uv = np.vstack([source_uv, destination_uv])
-        merged_segment = TrajectorySegment(
-            kind="SURFACE_SCAN",
-            uv=merged_uv,
-            xyz=merged_xyz,
-            spray_on=True,
-            note=f"{labels[0]} -> {labels[1]}",
-            region="LOWER"  # 【新增】
-        )
-        return destination_uv
-
     # =========================================================================
     # 4. 下半区排序与共轭连线（基于完美 1-to-1 共轭拓扑）
     # =========================================================================
@@ -5396,13 +5249,6 @@ def generate_seam_aware_trajectory(
 
         upper_accepted_x.extend([float(master_data[0]), float(slave_data[0])])
 
-    # =========================================================================
-    # 7. 3D 跨缝平滑过渡处理与元数据构建（保持原有机制）
-    # =========================================================================
-    # segments = _smooth_seam_jumps_xyz(
-    #     segments, nominal_radius=0.5 * target_spacing, sample_step=sample_step,
-    # )
-
     metadata: dict[str, object] = {
         "requested_spacing": nominal_spacing,
         "optimized_spacing": target_spacing,
@@ -5453,7 +5299,9 @@ def generate_seam_aware_trajectory(
         "segment_count": len(segments),
     }
     metadata["special_boundary_geometry"] = _special_boundary_geometry(
-        segments, target_spacing
+        segments,
+        target_spacing,
+        mesh=trimesh.Trimesh(vertices=data.xyz, faces=data.xyz_faces, process=False),
     )
     return segments, frame, metadata
 
@@ -5813,8 +5661,6 @@ def vtk_actor(polydata: vtk.vtkPolyData, color: tuple[float, float, float], opac
 
     # 【视觉增强】：将线段渲染为实体细管，能大幅减少共面闪烁，且视觉效果更高级
     actor.GetProperty().SetLineWidth(width)
-    # Tube rendering converts every polyline segment into extra geometry and
-    # makes camera interaction very sluggish for dense trajectories.
     actor.GetProperty().SetRenderLinesAsTubes(False)
 
     if wireframe:
@@ -5983,11 +5829,10 @@ class InteractiveVisualizer:
         self.optimization_events: queue.Queue = queue.Queue()
         self.optimization_generation = 0
         self.current_metadata: dict[str, object] | None = None
-        self.a_max = DEFAULT_A_MAX  # 默认值
-        self.j_max = DEFAULT_J_MAX  # 默认值
+        self.a_max = 1000.0  # 默认值
+        self.j_max = 5000.0  # 默认值
         self.hide_model = False
         self.hide_traj = False
-        self.enable_energy_optimization = False
 
         self.window = vtk.vtkRenderWindow()
         self.window.SetWindowName("OptCuts trajectory - VTK/OpenGL (Agien)")
@@ -6088,97 +5933,61 @@ class InteractiveVisualizer:
         if self.chart_context_actor:
             self.chart_renderer.RemoveActor(self.chart_context_actor)
 
-        if True:
-            if self.text_actor_2d_info:
-                self.right_renderer.RemoveActor(self.text_actor_2d_info)
+        if self.text_actor_2d_info:
+            self.right_renderer.RemoveActor(self.text_actor_2d_info)
 
         # === 【3D 轨迹绘制 - Actor 合并极速渲染（添加到 Layer 1 顶层渲染器）】 ===
-            # === 【3D 轨迹绘制 - 支持未侵入(黄)与侵入(红)独立分色】 ===
-            fixed_scan_append_3d = vtk.vtkAppendPolyData()  # 原 LOWER / UPPER
-            center_scan_append_3d = vtk.vtkAppendPolyData()  # 未侵入 CENTER (黄色)
-            intruded_scan_append_3d = (
-                vtk.vtkAppendPolyData()
-            )  # 侵入 LOWER/UPPER 的 CENTER (鲜红色)
-            overtravel_append_3d = vtk.vtkAppendPolyData()
-            blend_append_3d = vtk.vtkAppendPolyData()
-            intersection_points_3d = []
+        fixed_scan_append_3d = vtk.vtkAppendPolyData()
+        center_scan_append_3d = vtk.vtkAppendPolyData()
+        overtravel_append_3d = vtk.vtkAppendPolyData()
+        blend_append_3d = vtk.vtkAppendPolyData()
 
-            has_fixed_scan = False
-            has_center_scan = False
-            has_intruded_scan = False
-            has_overtravel = False
-            has_blend = False
+        has_fixed_scan = False
+        has_center_scan = False
+        has_overtravel = False
+        has_blend = False
 
-            for seg in trajectory:
-                if len(seg.xyz) < 2:
-                    continue
-                if seg.kind == "INTERSECTION_MARKER":
-                    intersection_points_3d.extend(np.asarray(seg.xyz, dtype=float))
-                    continue
-                poly = vtk_polyline(seg.xyz)
-                region_tag = str(getattr(seg, "region", "")).upper()
+        for seg in trajectory:
+            if len(seg.xyz) < 2:
+                continue
+            poly = vtk_polyline(seg.xyz)
+            if seg.kind == "SURFACE_SCAN":
+                if str(getattr(seg, "region", "")).upper() == "CENTER":
+                    center_scan_append_3d.AddInputData(poly)
+                    has_center_scan = True
+                else:
+                    fixed_scan_append_3d.AddInputData(poly)
+                    has_fixed_scan = True
+            elif seg.kind == "OVERTRAVEL":
+                overtravel_append_3d.AddInputData(poly)
+                has_overtravel = True
+            elif seg.kind == "SEAM_BLEND_3D":
+                blend_append_3d.AddInputData(poly)
+                has_blend = True
 
-                if seg.kind == "SURFACE_SCAN":
-                    if region_tag == "CENTER":
-                        center_scan_append_3d.AddInputData(poly)
-                        has_center_scan = True
-                    elif region_tag == "CENTER_INTRUDED":
-                        intruded_scan_append_3d.AddInputData(poly)
-                        has_intruded_scan = True
-                    else:
-                        fixed_scan_append_3d.AddInputData(poly)
-                        has_fixed_scan = True
-                elif seg.kind == "OVERTRAVEL":
-                    overtravel_append_3d.AddInputData(poly)
-                    has_overtravel = True
-                elif seg.kind == "SEAM_BLEND_3D":
-                    blend_append_3d.AddInputData(poly)
-                    has_blend = True
+        # 绘制主喷涂轨迹 (红色)
+        if has_fixed_scan:
+            fixed_scan_append_3d.Update()
+            actor = vtk_actor(fixed_scan_append_3d.GetOutput(), (0.72, 0.25, 0.28), opacity=0.55, width=2.5)
+            self.left_overlay_renderer.AddActor(actor)
+            self.trajectory_actors_3d.append(actor)
 
-            # 1. 原 LOWER / UPPER 保护轨迹 (暗红)
-            if has_fixed_scan:
-                fixed_scan_append_3d.Update()
-                actor = vtk_actor(
-                    fixed_scan_append_3d.GetOutput(),
-                    (0.72, 0.25, 0.28),
-                    opacity=0.55,
-                    width=2.5,
-                )
+        if self.optimization_reference:
+            reference_append = vtk.vtkAppendPolyData()
+            for seg in self.optimization_reference:
+                if seg.kind == "SURFACE_SCAN" and len(seg.xyz) >= 2:
+                    reference_append.AddInputData(vtk_polyline(seg.xyz))
+            reference_append.Update()
+            if reference_append.GetOutput().GetNumberOfLines() > 0:
+                actor = vtk_actor(reference_append.GetOutput(), (0.20, 0.24, 0.30), opacity=0.42, width=1.5)
                 self.left_overlay_renderer.AddActor(actor)
                 self.trajectory_actors_3d.append(actor)
 
-            # 2. 未侵入的正常 CENTER 轨迹 (亮黄色)
-            if has_center_scan:
-                center_scan_append_3d.Update()
-                actor = vtk_actor(
-                    center_scan_append_3d.GetOutput(),
-                    (1.0, 0.72, 0.05),
-                    opacity=1.0,
-                    width=4.5,
-                )
-                self.left_overlay_renderer.AddActor(actor)
-                self.trajectory_actors_3d.append(actor)
-
-            # 3. 侵入到 LOWER/UPPER 内部的 CENTER 子段 (警示鲜红)
-            if has_intruded_scan:
-                intruded_scan_append_3d.Update()
-                actor = vtk_actor(
-                    intruded_scan_append_3d.GetOutput(),
-                    (1.0, 0.0, 0.0),
-                    opacity=1.0,
-                    width=5.0,
-                )
-                self.left_overlay_renderer.AddActor(actor)
-                self.trajectory_actors_3d.append(actor)
-
-            if intersection_points_3d:
-                marker_actor = vtk_actor(
-                    vtk_points(np.asarray(intersection_points_3d, dtype=float)),
-                    (0.0, 1.0, 0.0), opacity=1.0, width=8.0,
-                )
-                marker_actor.GetProperty().SetPointSize(10.0)
-                self.left_overlay_renderer.AddActor(marker_actor)
-                self.trajectory_actors_3d.append(marker_actor)
+        if has_center_scan:
+            center_scan_append_3d.Update()
+            actor = vtk_actor(center_scan_append_3d.GetOutput(), (1.0, 0.72, 0.05), opacity=1.0, width=4.5)
+            self.left_overlay_renderer.AddActor(actor)
+            self.trajectory_actors_3d.append(actor)
 
         # 绘制过渡空跑轨迹 (绿色)
         if has_overtravel:
@@ -6199,8 +6008,14 @@ class InteractiveVisualizer:
         # Recompute from the displayed (possibly optimized) trajectory so the
         # blue geometry follows live edits rather than the initial scan set.
         special_geometry = _special_boundary_geometry(
-            trajectory, float(metadata.get("optimized_spacing", self.sample_step))
+            trajectory,
+            float(metadata.get("optimized_spacing", self.sample_step)),
+            mesh=self.mesh,
         )
+        current_blank_centers = metadata.get("optimization_blank_centers_3d")
+        if isinstance(current_blank_centers, dict):
+            special_geometry["blank_centers_3d"] = dict(current_blank_centers)
+        metadata["special_boundary_geometry"] = special_geometry
         connector_3d = special_geometry.get("connectors_3d", []) if isinstance(special_geometry, dict) else []
         if connector_3d:
             append = vtk.vtkAppendPolyData()
@@ -6213,6 +6028,30 @@ class InteractiveVisualizer:
                 actor = vtk_actor(append.GetOutput(), (0.05, 0.25, 1.0), opacity=1.0, width=4.0)
                 self.left_overlay_renderer.AddActor(actor)
                 self.trajectory_actors_3d.append(actor)
+
+        blank_centers = special_geometry.get("blank_centers_3d", {})
+        if isinstance(blank_centers, dict) and blank_centers:
+            points = np.asarray(list(blank_centers.values()), dtype=float)
+            actor = vtk_actor(vtk_points(points), (0.05, 0.95, 0.15), opacity=1.0)
+            actor.GetProperty().SetPointSize(16.0)
+            try:
+                actor.GetProperty().RenderPointsAsSpheresOn()
+            except AttributeError:
+                pass
+            self.left_overlay_renderer.AddActor(actor)
+            self.trajectory_actors_3d.append(actor)
+
+        repulsion_centers = special_geometry.get("repulsion_centers_3d", {})
+        if isinstance(repulsion_centers, dict) and repulsion_centers:
+            points = np.asarray(list(repulsion_centers.values()), dtype=float)
+            actor = vtk_actor(vtk_points(points), (1.0, 0.02, 0.02), opacity=1.0)
+            actor.GetProperty().SetPointSize(16.0)
+            try:
+                actor.GetProperty().RenderPointsAsSpheresOn()
+            except AttributeError:
+                pass
+            self.left_overlay_renderer.AddActor(actor)
+            self.trajectory_actors_3d.append(actor)
 
         # === 【2D 轨迹绘制 - Actor 合并】 ===
         scan_append_2d = vtk.vtkAppendPolyData()
@@ -6346,14 +6185,14 @@ class TkControlPanel:
 
         tk.Label(self.root, text="最大加速度 (mm/s²): ", font=("Arial", 11)).grid(row=3, column=0, padx=10, pady=6,
                                                                                   sticky="w")
-        self.a_max_var = tk.StringVar(value=str(DEFAULT_A_MAX))  # 默认值，根据实际机器人设定
+        self.a_max_var = tk.StringVar(value="1000.0")  # 默认值，根据实际机器人设定
         self.a_max_entry = tk.Entry(self.root, textvariable=self.a_max_var, width=15, font=("Arial", 11))
         self.a_max_entry.grid(row=3, column=1, padx=10, pady=6, sticky="ew")
 
         # 【新增】：最大加加速度输入
         tk.Label(self.root, text="最大加加速度 (mm/s³): ", font=("Arial", 11)).grid(row=4, column=0, padx=10, pady=6,
                                                                                     sticky="w")
-        self.j_max_var = tk.StringVar(value=str(DEFAULT_J_MAX))  # 默认值
+        self.j_max_var = tk.StringVar(value="5000.0")  # 默认值
         self.j_max_entry = tk.Entry(self.root, textvariable=self.j_max_var, width=15, font=("Arial", 11))
         self.j_max_entry.grid(row=4, column=1, padx=10, pady=6, sticky="ew")
 
@@ -6480,19 +6319,12 @@ class TkControlPanel:
             arc_lock_guard_d=arc_lock_guard_d,
         )
 
-        optimized = split_center_intrusions_3d(
-            optimized, mesh=self.visualizer.mesh,
-            intersection_tol=1.0,
-            extension_tol=1.0 * new_d,
+        fixed_blank_geometry = _special_boundary_geometry(
+            optimized, new_d, mesh=self.visualizer.mesh
         )
-
-        if not self.visualizer.enable_energy_optimization:
-            self.visualizer.update_trajectory(
-                optimized, planning_frame, metadata, trajectory_2d=raw_trajectory
-            )
-            self.visualizer.window.Render()
-            print("[Energy optimization disabled]")
-            return
+        metadata["optimization_blank_centers_3d"] = dict(
+            fixed_blank_geometry.get("blank_centers_3d", {})
+        )
 
         # Relax the coupled straight portions first; quintic fitting is done
         # once from the completed relaxed geometry in the worker below.
@@ -6512,6 +6344,7 @@ class TkControlPanel:
                 result = optimize_center_trajectories_dual_blank_energy(
                     trajectory=optimized, mesh=self.visualizer.mesh,
                     target_spacing=new_d, sample_step=self.visualizer.sample_step,
+                    blank_centers_3d=metadata["optimization_blank_centers_3d"],
                     on_iteration=enqueue_iteration,
                 )
                 result = fit_quintic_bspline_trajectories(
@@ -6592,9 +6425,15 @@ def _show_result(
         trajectory_speed: float,
         spray_distance: float,
         trajectory_2d: Sequence[TrajectorySegment] | None = None,
-        enable_energy_optimization: bool = False,
 ) -> None:
     """Run the interactive visualizer and display live spline-boundary optimization."""
+    metadata = dict(metadata)
+    fixed_blank_geometry = _special_boundary_geometry(
+        trajectory, initial_spacing, mesh=mesh
+    )
+    metadata["optimization_blank_centers_3d"] = dict(
+        fixed_blank_geometry.get("blank_centers_3d", {})
+    )
     visualizer = InteractiveVisualizer(
         mesh, data, precut_seam, cut_edges, sample_step, initial_spacing,
         csv_path, metadata_path, paq_path, trajectory_speed, spray_distance
@@ -6609,11 +6448,6 @@ def _show_result(
     visualizer.window.Render()
     visualizer.interactor.Initialize()
 
-    if not enable_energy_optimization:
-        print("[Energy optimization disabled]")
-        visualizer.interactor.Start()
-        return
-
     print("\n[开始实时样条边界能量场轨迹优化...]")
     visualizer.reset_energy_history()
     visualizer.optimization_reference = list(trajectory)
@@ -6627,24 +6461,6 @@ def _show_result(
             generation, "iteration", preview, iteration, total_energy,
             energy_components, planning_frame, metadata, trajectory_2d,
         ))
-        return
-        visualizer.record_energy(iteration, total_energy)
-        visualizer.update_trajectory(
-            preview, planning_frame, metadata, trajectory_2d=trajectory_2d
-        )
-        visualizer.window.Render()
-        panel.root.update_idletasks()
-        print(
-            f"\r实时优化进度: {iteration}  E={total_energy:.6e}  "
-            f"cov={energy_components['coverage']:.3e}  "
-            f"spacing={energy_components['spacing']:.3e}  "
-            f"boundary={energy_components['boundary']:.3e}  "
-            f"smooth={energy_components['smooth']:.3e}  "
-            f"move(mean/max)="
-            f"{energy_components['center_displacement_mean']:.4f}/"
-            f"{energy_components['center_displacement_max']:.4f} mm",
-            flush=True,
-        )
 
     def run_optimization():
         try:
@@ -6654,14 +6470,15 @@ def _show_result(
                 mesh=mesh,
                 target_spacing=initial_spacing,
                 sample_step=sample_step,
+                blank_centers_3d=metadata["optimization_blank_centers_3d"],
                 on_iteration=live_iteration_callback,
             )
             optimized = fit_quintic_bspline_trajectories(
                 trajectory=optimized,
                 mesh=mesh,
                 speed=trajectory_speed,
-                a_max=DEFAULT_A_MAX,
-                j_max=DEFAULT_J_MAX,
+                a_max=1000.0,
+                j_max=5000.0,
                 sample_step=sample_step,
                 target_spacing=initial_spacing,
                 project_to_mesh=False,
@@ -6671,8 +6488,14 @@ def _show_result(
                 trajectory_2d,
             ))
         except Exception as exc:
-            print(f"[Energy worker failed] task={generation}: {exc!r}", flush=True)
-            optimization_events.put((generation, "error", exc))
+            import traceback
+            error_traceback = traceback.format_exc()
+            print(
+                f"[Energy worker failed] task={generation}: {exc!r}\n"
+                f"{error_traceback}",
+                flush=True,
+            )
+            optimization_events.put((generation, "error", exc, error_traceback))
     print("\n[轨迹准备就绪，开启可视化界面！]")
     # 进入主事件循环
     def on_timer(obj, event):
@@ -6691,6 +6514,11 @@ def _show_result(
                     "uniform_metric_smoothed",
                     components.get("uniform_metric", total_energy),
                 ))
+                latest_blank_centers = components.get("blank_centers_3d")
+                if isinstance(latest_blank_centers, dict):
+                    event_metadata["optimization_blank_centers_3d"] = dict(
+                        latest_blank_centers
+                    )
                 visualizer.record_energy(iteration, stop_metric)
                 visualizer.update_trajectory(
                     preview, event_frame, event_metadata,
@@ -6719,6 +6547,8 @@ def _show_result(
                 print("\n[Live optimization complete]")
             else:
                 print(f"\n[Live optimization failed] {update[2]!r}")
+                if len(update) > 3:
+                    print(update[3], flush=True)
         visualizer.window.Render()
 
     visualizer.interactor.AddObserver("TimerEvent", on_timer)
@@ -6789,17 +6619,13 @@ def _parse_arguments() -> argparse.Namespace:
     )
 
     # 【新增】：最大加速度和最大加加速度参数
-    parser.add_argument("--a-max", type=float, default=DEFAULT_A_MAX,
-                        help=f"Robot maximum acceleration in mm/s² (default: {DEFAULT_A_MAX:g}).")
-    parser.add_argument("--j-max", type=float, default=DEFAULT_J_MAX,
-                        help=f"Robot maximum jerk in mm/s³ (default: {DEFAULT_J_MAX:g}).")
+    parser.add_argument("--a-max", type=float, default=1000.0,
+                        help="Robot maximum acceleration in mm/s² (default: 1000.0).")
+    parser.add_argument("--j-max", type=float, default=5000.0,
+                        help="Robot maximum jerk in mm/s³ (default: 5000.0).")
 
     parser.add_argument("--no-animation", action="store_true", help="Skip the OptCuts iteration animation.")
     parser.add_argument("--no-show", action="store_true", help="Do not open the final VTK/OpenGL window.")
-    parser.add_argument(
-        "--energy-optimization", action="store_true",
-        help="Enable the optional post-processing energy optimization.",
-    )
     return parser.parse_args()
 
 
@@ -6871,13 +6697,8 @@ def main() -> None:
         arc_lock_guard_d=args.arc_lock_guard_d,
     )
 
-    arc_trajectory = split_center_intrusions_3d(
-        arc_trajectory, mesh=mesh, intersection_tol=1.0,
-        extension_tol=1.0 * selected_spacing,
-    )
-
     # 对优化后的每条喷涂轨迹做曲率自适应五次最小二乘拟合；过渡段保持原样。
-    if args.no_show and args.energy_optimization:
+    if args.no_show:
         relaxed_trajectory = optimize_center_trajectories_dual_blank_energy(
         trajectory=arc_trajectory,
         mesh=mesh,
@@ -6924,7 +6745,6 @@ def main() -> None:
             selected_spacing, sample_step_val, csv_path, metadata_path,
             paq_path, args.trajectory_speed, args.spray_distance,
             trajectory_2d=raw_trajectory,
-            enable_energy_optimization=args.energy_optimization,
         )
     if not args.no_animation:
         _play_iteration_animation(optcuts_mesh, result_obj)
