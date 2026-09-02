@@ -1704,6 +1704,7 @@ def _special_boundary_geometry(
             "blank_centers_3d": {},
             "repulsion_centers_3d": {},
             "void_center_eligibility": {},
+            "periodic_pair_blocked": False,
             "target_distance": target,
         }
 
@@ -1953,6 +1954,15 @@ def _special_boundary_geometry(
                 "eligible": False,
                 "reason": "missing_boundary_trajectory",
             }
+            # A missing red side is still closed by its model-boundary
+            # endpoint connector. Keep the selected records for rendering.
+            direct_record = direct_by_side.get(side)
+            if direct_record is not None:
+                selected_records[side] = [periodic_record, direct_record]
+                selected_void_connectors_3d[side] = [
+                    periodic_record["line_3d"],
+                    direct_record["line_3d"],
+                ]
             continue
         boundary_tree = cKDTree(raw_boundary_tracks[side])
         first_max_gap = float(np.max(boundary_tree.query(
@@ -2045,7 +2055,22 @@ def _special_boundary_geometry(
         if not len(candidate_ids):
             continue
         void_distances = spray_tree.query(triangle_centers[candidate_ids])[0]
-        best_center = triangle_centers[candidate_ids[int(np.argmax(void_distances))]]
+        # The face center with the largest clearance is only a discrete seed.
+        # Interpolate its strongest neighbouring face-center samples so the
+        # reported blank point is not quantized to one triangle.
+        order = np.argsort(void_distances)[::-1]
+        interpolation_count = min(8, len(order))
+        selected = order[:interpolation_count]
+        local_distances = np.asarray(void_distances[selected], dtype=float)
+        weights = np.maximum(
+            local_distances - float(local_distances.min()),
+            1.0e-6,
+        ) ** 2
+        best_center = np.average(
+            triangle_centers[candidate_ids[selected]],
+            axis=0,
+            weights=weights,
+        )
         projected = _project_to_mesh(mesh, best_center)
         if projected is not None:
             blank_centers_3d[side] = projected.tolist()
@@ -2072,8 +2097,14 @@ def _special_boundary_geometry(
         "blank_centers_3d": blank_centers_3d,
         "repulsion_centers_3d": repulsion_centers_3d,
         "void_center_eligibility": void_center_eligibility,
+        # MODEL_BOUNDARY only closes a side that has no red boundary track.
+        # It is not evidence that a physical barrier separates C0 and C_last.
+        "periodic_pair_blocked": False,
         "target_distance": target,
+        "selected_connector_records": selected_records,
     }
+
+
 
 class _UVToXYZMapper:
     def __init__(self, data: ObjUVData):
@@ -3589,7 +3620,7 @@ def _optimize_trajectory_region_energy(
             boundary_samples = _fixed_spline_samples(
                 trajectory, boundary_center_idx, step0
             )
-            boundary_tree = cKDTree(boundary_samples) if len(boundary_samples) else None
+            boundary_tree = cKDTree(boundary_samples) if len(boundary_samples) else None#选择最靠近红色区域的 CENTER 轨迹  
             ranked = []
             for index in red_candidates:
                 points = np.asarray(trajectory[index].xyz, dtype=float)
@@ -3851,9 +3882,8 @@ def _optimize_trajectory_region_energy(
                 "blank_centers_3d", {}
             )
         if periodic_pair_blocked is None:
-            periodic_pair_blocked = any(
-                record.get("kind") == "MODEL_BOUNDARY"
-                for record in center_geometry.get("connector_records", [])
+            periodic_pair_blocked = bool(
+                center_geometry.get("periodic_pair_blocked", False)
             )
         if isinstance(fixed_blank_centers, dict):
             for side in ("LOWER", "UPPER"):
@@ -3883,7 +3913,7 @@ def _optimize_trajectory_region_energy(
         # distorting the straight-to-arc transition before it is restored.
         moving_point = np.ones(len(P), dtype=bool)
         if moving_region != "CENTER":
-            moving_point = ~np.concatenate(locked_masks)
+            moving_point = ~np.concatenate(locked_masks)#也是固定参考点，会被其他center点排斥力影响
         elif middle_anchor_index is not None:
             anchor_start = int(offsets[middle_anchor_index])
             anchor_stop = int(offsets[middle_anchor_index + 1])
@@ -3916,7 +3946,7 @@ def _optimize_trajectory_region_energy(
         # The selected red paths form a spring chain ordered far-to-near from
         # CENTER.  Line 0 is the outer reference; each progressively closer
         # path relaxes toward d from its outer neighbour without applying a
-        # spring force back into that reference chain.
+        # spring force back into that reference chain.//this prat for lower and upper region
         neighbour_links = set()
         if moving_region != "CENTER" and num_lines >= 2:
             line_trees = [cKDTree(line) for line in lines]
@@ -4007,8 +4037,8 @@ def _optimize_trajectory_region_energy(
                     gain=transverse_weight * gain,
                 )
 
-            # C0 and C_last are co-leaders. A direct model-boundary connector
-            # blocks their periodic interaction and is treated as infinite gap.
+            # C0 and C_last remain periodic neighbours unless an independent
+            # physical-barrier test explicitly blocks their interaction.
             if not periodic_pair_blocked:
                 apply_follower(0, num_lines - 1)
                 apply_follower(num_lines - 1, 0)
@@ -4047,7 +4077,7 @@ def _optimize_trajectory_region_energy(
                 void_force, P, offsets
             )
 
-        # --- F. High-priority radial hard barrier for CENTER. ---
+        # --- F. High-priority radial hard barrier for CENTER. ---red->out 
         barrier_force = np.zeros_like(F)
         barrier_direction = np.zeros_like(F)
         barrier_danger = np.zeros(len(P), dtype=bool)
@@ -4076,7 +4106,7 @@ def _optimize_trajectory_region_energy(
             void_force[barrier_danger] = 0.0
             F += barrier_force
 
-        # --- G. Displacement caps and annealing. ---
+        # --- G. Displacement caps and annealing. ---F end
         # A small relaxation step prevents a compressed pair from jumping
         # across its d-equilibrium in one iteration.
         # Dampen LOWER/UPPER motion as each pair approaches its d equilibrium.
@@ -4518,9 +4548,8 @@ def optimize_center_trajectories_dual_blank_energy(
         )
     else:
         current_blank_centers = dict(current_blank_centers)
-    current_periodic_blocked = any(
-        record.get("kind") == "MODEL_BOUNDARY"
-        for record in initial_blank_geometry.get("connector_records", [])
+    current_periodic_blocked = bool(
+        initial_blank_geometry.get("periodic_pair_blocked", False)
     )
     step_kwargs = dict(kwargs)
     step_kwargs.update({
@@ -4597,9 +4626,8 @@ def optimize_center_trajectories_dual_blank_energy(
                 point = np.asarray(value, dtype=float)
                 if point.shape == (3,) and np.isfinite(point).all():
                     current_blank_centers[side] = point.tolist()
-        current_periodic_blocked = any(
-            record.get("kind") == "MODEL_BOUNDARY"
-            for record in latest_blank_geometry.get("connector_records", [])
+        current_periodic_blocked = bool(
+            latest_blank_geometry.get("periodic_pair_blocked", False)
         )
         if on_iteration is not None:
             moved = []
@@ -6016,19 +6044,75 @@ class InteractiveVisualizer:
         if isinstance(current_blank_centers, dict):
             special_geometry["blank_centers_3d"] = dict(current_blank_centers)
         metadata["special_boundary_geometry"] = special_geometry
-        connector_3d = special_geometry.get("connectors_3d", []) if isinstance(special_geometry, dict) else []
+        # All candidate 1.5d connectors remain blue.
+        connector_3d = (
+            special_geometry.get("connectors_3d", [])
+            if isinstance(special_geometry, dict)
+            else []
+        )
         if connector_3d:
             append = vtk.vtkAppendPolyData()
             for line in connector_3d:
                 points = np.asarray(line, dtype=float)
-                if points.shape == (2, 3) and np.linalg.norm(points[1] - points[0]) > EPS:
+                if (
+                    points.shape == (2, 3)
+                    and np.linalg.norm(points[1] - points[0]) > EPS
+                ):
                     append.AddInputData(vtk_polyline(points))
             append.Update()
             if append.GetOutput().GetNumberOfLines() > 0:
-                actor = vtk_actor(append.GetOutput(), (0.05, 0.25, 1.0), opacity=1.0, width=4.0)
+                actor = vtk_actor(
+                    append.GetOutput(),
+                    (0.05, 0.25, 1.0),
+                    opacity=0.35,
+                    width=2.0,
+                )
                 self.left_overlay_renderer.AddActor(actor)
                 self.trajectory_actors_3d.append(actor)
 
+        # Only the selected periodic/FIRST/LAST connectors are green.
+        selected_3d = []
+        selected_records = (
+            special_geometry.get("selected_connector_records", {})
+            if isinstance(special_geometry, dict)
+            else {}
+        )
+        seen_selected = set()
+
+        if isinstance(selected_records, dict):
+            for records in selected_records.values():
+                if not isinstance(records, list):
+                    continue
+                for record in records:
+                    line = record.get("line_3d")
+                    if line is None:
+                        continue
+                    points = np.asarray(line, dtype=float)
+                    if points.shape != (2, 3):
+                        continue
+                    if np.linalg.norm(points[1] - points[0]) <= EPS:
+                        continue
+
+                    key = tuple(np.round(points.reshape(-1), 8))
+                    if key in seen_selected:
+                        continue
+                    seen_selected.add(key)
+                    selected_3d.append(points)
+
+        if selected_3d:
+            append = vtk.vtkAppendPolyData()
+            for points in selected_3d:
+                append.AddInputData(vtk_polyline(points))
+            append.Update()
+            if append.GetOutput().GetNumberOfLines() > 0:
+                actor = vtk_actor(
+                    append.GetOutput(),
+                    (0.0, 0.85, 0.1),
+                    opacity=1.0,
+                    width=5.0,
+                )
+                self.left_overlay_renderer.AddActor(actor)
+                self.trajectory_actors_3d.append(actor)
         blank_centers = special_geometry.get("blank_centers_3d", {})
         if isinstance(blank_centers, dict) and blank_centers:
             points = np.asarray(list(blank_centers.values()), dtype=float)
@@ -6088,6 +6172,39 @@ class InteractiveVisualizer:
                 actor_2d = vtk_actor(vtk_polyline(points), (0.05, 0.25, 1.0), opacity=1.0, width=4.0)
                 self.right_renderer.AddActor(actor_2d)
                 self.trajectory_actors_2d.append(actor_2d)
+
+        # Highlight only the selected periodic/FIRST/LAST or MODEL_BOUNDARY
+        # connectors in green on the UV view as well.
+        selected_2d = []
+        seen_selected_2d = set()
+        if isinstance(selected_records, dict):
+            for records in selected_records.values():
+                if not isinstance(records, list):
+                    continue
+                for record in records:
+                    line = record.get("line_2d")
+                    if line is None:
+                        continue
+                    points = np.asarray(line, dtype=float)
+                    if points.shape != (2, 2):
+                        continue
+                    if np.linalg.norm(points[1] - points[0]) <= EPS:
+                        continue
+                    key = tuple(np.round(points.reshape(-1), 8))
+                    if key in seen_selected_2d:
+                        continue
+                    seen_selected_2d.add(key)
+                    selected_2d.append(points)
+
+        for points in selected_2d:
+            actor_2d = vtk_actor(
+                vtk_polyline(points),
+                (0.0, 0.85, 0.1),
+                opacity=1.0,
+                width=5.0,
+            )
+            self.right_renderer.AddActor(actor_2d)
+            self.trajectory_actors_2d.append(actor_2d)
 
         # === 3. 绘制辅助参考线与点集 ===
         ref_line_pts = np.vstack([

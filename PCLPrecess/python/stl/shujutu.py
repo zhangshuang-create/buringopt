@@ -1333,10 +1333,10 @@ def compute_enclosed_region_areas(
     for region in ("LOWER", "UPPER"):
         if not tracks[region]:
             continue
-        # Select the trajectory closest to CENTER on each side.
-        reference = center[0] if region == "LOWER" and center else (center[-1] if center else None)
-        nearest = min(tracks[region], key=lambda line: float(np.linalg.norm(line.mean(0) - (reference.mean(0) if reference is not None else line.mean(0)))))
-        selected[region] = nearest
+        # Generation order defines the two CENTER-facing outer boundaries.
+        selected[region] = (
+            tracks[region][-1] if region == "LOWER" else tracks[region][0]
+        )
     # LOWER and UPPER each form their own closed region via endpoint chord.
     upper_lower = sum(_closed_track_area(line) for line in selected.values())
     remaining = max(0.0, center_closed - upper_lower)
@@ -1524,44 +1524,54 @@ def _special_boundary_connectors(
     return lines3d, lines2d
 
 
-def _yellow_center_connectors(
-        trajectory: Sequence[TrajectorySegment], spacing: float = 30.0,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Build unconditional yellow endpoint links for the two CENTER end tracks."""
-    center = [
-        np.asarray(seg.xyz, dtype=float)
-        for seg in trajectory
-        if seg.kind == "SURFACE_SCAN"
-        and str(getattr(seg, "region", "")).upper() == "CENTER"
-        and len(seg.xyz) >= 2
-    ]
-    if len(center) < 2:
-        return [], []
-    first, last = center[0], center[-1]
-    lines3d = [np.vstack([first[0], last[0]]), np.vstack([first[-1], last[-1]])]
-    lines2d: list[np.ndarray] = []
-
-    return lines3d, lines2d
-
-
-def _yellow_special_paths(trajectory: Sequence[TrajectorySegment]) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Return CENTER paths and LOWER/UPPER paths for separate highlighting."""
-    groups: dict[str, list[np.ndarray]] = {"CENTER": [], "LOWER": [], "UPPER": []}
-    for seg in trajectory:
+def _highlighted_region_outlines(
+        trajectory: Sequence[TrajectorySegment],
+) -> tuple[list[np.ndarray], list[np.ndarray], set[int]]:
+    """Build the purple CENTER and yellow new-coverage closed outlines."""
+    groups: dict[str, list[tuple[int, np.ndarray]]] = {
+        "CENTER": [], "LOWER": [], "UPPER": [],
+    }
+    for index, seg in enumerate(trajectory):
         region = str(getattr(seg, "region", "")).upper()
         if seg.kind == "SURFACE_SCAN" and region in groups and len(seg.xyz) >= 2:
-            groups[region].append(np.asarray(seg.xyz, dtype=float))
-    center_result: list[np.ndarray] = []
-    outer_result: list[np.ndarray] = []
+            groups[region].append((index, np.asarray(seg.xyz, dtype=float)))
+
+    purple_paths: list[np.ndarray] = []
+    yellow_paths: list[np.ndarray] = []
+    highlighted_indices: set[int] = set()
     if len(groups["CENTER"]) >= 2:
-        center_result.extend([groups["CENTER"][0], groups["CENTER"][-1]])
+        first_index, first = groups["CENTER"][0]
+        last_index, last = groups["CENTER"][-1]
+        direct = (
+            np.linalg.norm(first[0] - last[0])
+            + np.linalg.norm(first[-1] - last[-1])
+        )
+        crossed = (
+            np.linalg.norm(first[0] - last[-1])
+            + np.linalg.norm(first[-1] - last[0])
+        )
+        if direct <= crossed:
+            endpoint_links = [
+                np.vstack([first[0], last[0]]),
+                np.vstack([first[-1], last[-1]]),
+            ]
+        else:
+            endpoint_links = [
+                np.vstack([first[0], last[-1]]),
+                np.vstack([first[-1], last[0]]),
+            ]
+        purple_paths.extend([first, last, *endpoint_links])
+        highlighted_indices.update((first_index, last_index))
+
     for region in ("LOWER", "UPPER"):
         if groups[region]:
-            reference = groups["CENTER"][0 if region == "LOWER" else -1] if groups["CENTER"] else None
-            line = min(groups[region], key=lambda line: float(np.linalg.norm(line.mean(0) - (reference.mean(0) if reference is not None else line.mean(0)))))
-            # Include the track and its direct endpoint chord in the highlight.
-            outer_result.extend([line, np.vstack([line[0], line[-1]])])
-    return center_result, outer_result
+            selected_index, line = (
+                groups[region][-1] if region == "LOWER"
+                else groups[region][0]
+            )
+            yellow_paths.extend([line, np.vstack([line[0], line[-1]])])
+            highlighted_indices.add(selected_index)
+    return purple_paths, yellow_paths, highlighted_indices
 
 def optimize_spacing(nominal: float, dimensions: np.ndarray) -> Optimum:
     nominal = float(nominal)
@@ -4747,8 +4757,9 @@ class InteractiveVisualizer:
         self.window.SetWindowName("OptCuts trajectory - VTK/OpenGL (fitcurveplan)")
         self.window.SetSize(1600, 900)
         self.window.SetMultiSamples(0)
-        # 【新增】：1. 设置渲染窗口支持 2 个层级 (Layer 0 和 Layer 1)
-        self.window.SetNumberOfLayers(2)
+        # Mesh, ordinary trajectories, and region outlines use independent
+        # layers so coincident highlighted paths never inherit the red scan.
+        self.window.SetNumberOfLayers(3)
 
         # 底层渲染器 Layer 0：专门绘制 3D 网格模型
         self.left_renderer = vtk.vtkRenderer()
@@ -4763,6 +4774,14 @@ class InteractiveVisualizer:
         # 共享 3D 视角相机（旋转/平移/缩放自动完美同步）
         self.left_overlay_renderer.SetActiveCamera(self.left_renderer.GetActiveCamera())
 
+        self.left_highlight_renderer = vtk.vtkRenderer()
+        self.left_highlight_renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
+        self.left_highlight_renderer.SetLayer(2)
+        self.left_highlight_renderer.EraseOff()
+        self.left_highlight_renderer.SetActiveCamera(
+            self.left_renderer.GetActiveCamera()
+        )
+
         self.right_renderer = vtk.vtkRenderer()
         self.right_renderer.SetViewport(0.5, 0.34, 1.0, 1.0)
         self.right_renderer.SetLayer(0)
@@ -4774,8 +4793,12 @@ class InteractiveVisualizer:
         self.rate_renderer.SetViewport(0.5, 0.17, 1.0, 0.34)
         self.rate_renderer.SetLayer(0)
 
-        for ren in (self.left_renderer, self.left_overlay_renderer, self.right_renderer, self.chart_renderer, self.rate_renderer):
-            if ren != self.left_overlay_renderer:
+        for ren in (
+            self.left_renderer, self.left_overlay_renderer,
+            self.left_highlight_renderer, self.right_renderer,
+            self.chart_renderer, self.rate_renderer,
+        ):
+            if ren not in (self.left_overlay_renderer, self.left_highlight_renderer):
                 ren.SetBackground(0.96, 0.97, 0.98)
             self.window.AddRenderer(ren)
 
@@ -4841,6 +4864,7 @@ class InteractiveVisualizer:
         # 1. 清理原有的 3D 和 2D 轨迹 Actor
         for actor in self.trajectory_actors_3d:
             self.left_overlay_renderer.RemoveActor(actor)
+            self.left_highlight_renderer.RemoveActor(actor)
         self.trajectory_actors_3d.clear()
 
         for actor in self.trajectory_actors_2d:
@@ -4867,13 +4891,18 @@ class InteractiveVisualizer:
         has_overtravel = False
         has_blend = False
 
-        for seg in trajectory:
+        purple_paths, yellow_paths, highlighted_indices = (
+            _highlighted_region_outlines(trajectory)
+        )
+
+        for segment_index, seg in enumerate(trajectory):
             if len(seg.xyz) < 2:
                 continue
             poly = vtk_polyline(seg.xyz)
             if seg.kind == "SURFACE_SCAN":
-                scan_append_3d.AddInputData(poly)
-                has_scan = True
+                if segment_index not in highlighted_indices:
+                    scan_append_3d.AddInputData(poly)
+                    has_scan = True
             elif seg.kind == "OVERTRAVEL":
                 overtravel_append_3d.AddInputData(poly)
                 has_overtravel = True
@@ -4914,35 +4943,43 @@ class InteractiveVisualizer:
             self.left_overlay_renderer.AddActor(actor)
             self.trajectory_actors_3d.append(actor)
 
-        yellow_3d, yellow_2d = _yellow_center_connectors(
-            trajectory, float(metadata.get("optimized_spacing", self.current_spacing))
-        )
-        if yellow_3d:
+        # Draw closed area boundaries last on a dedicated top layer.  The
+        # corresponding scan paths were excluded from the ordinary red actor.
+        if purple_paths:
             append = vtk.vtkAppendPolyData()
-            for line in yellow_3d:
-                append.AddInputData(vtk_polyline(line))
-            append.Update()
-            actor = vtk_actor(append.GetOutput(), (1.0, 0.45, 0.7), opacity=1.0, width=4.0)
-            self.left_overlay_renderer.AddActor(actor)
-            self.trajectory_actors_3d.append(actor)
-
-        # Highlight the region-defining tracks; CENTER connectors are pink above.
-        center_paths, outer_paths = _yellow_special_paths(trajectory)
-        if center_paths:
-            append = vtk.vtkAppendPolyData()
-            for path in center_paths:
+            for path in purple_paths:
                 append.AddInputData(vtk_polyline(path))
             append.Update()
-            actor = vtk_actor(append.GetOutput(), (1.0, 0.45, 0.7), opacity=1.0, width=5.0)
-            self.left_overlay_renderer.AddActor(actor)
+            actor = vtk_actor(
+                append.GetOutput(), (0.62, 0.08, 0.92), opacity=1.0, width=6.0
+            )
+            self.left_highlight_renderer.AddActor(actor)
             self.trajectory_actors_3d.append(actor)
-        if outer_paths:
+            endpoint_points = np.vstack([
+                purple_paths[0][[0, -1]],
+                purple_paths[1][[0, -1]],
+            ])
+            endpoint_actor = vtk_actor(
+                vtk_points(endpoint_points),
+                (0.62, 0.08, 0.92),
+                opacity=1.0,
+            )
+            endpoint_actor.GetProperty().SetPointSize(14.0)
+            try:
+                endpoint_actor.GetProperty().RenderPointsAsSpheresOn()
+            except AttributeError:
+                pass
+            self.left_highlight_renderer.AddActor(endpoint_actor)
+            self.trajectory_actors_3d.append(endpoint_actor)
+        if yellow_paths:
             append = vtk.vtkAppendPolyData()
-            for path in outer_paths:
+            for path in yellow_paths:
                 append.AddInputData(vtk_polyline(path))
             append.Update()
-            actor = vtk_actor(append.GetOutput(), (1.0, 1.0, 0.0), opacity=1.0, width=5.0)
-            self.left_overlay_renderer.AddActor(actor)
+            actor = vtk_actor(
+                append.GetOutput(), (1.0, 0.92, 0.0), opacity=1.0, width=6.0
+            )
+            self.left_highlight_renderer.AddActor(actor)
             self.trajectory_actors_3d.append(actor)
 
         # === 【2D 轨迹绘制 - Actor 合并】 ===
@@ -4975,11 +5012,6 @@ class InteractiveVisualizer:
 
         for line in connector_2d:
             actor_2d = vtk_actor(vtk_polyline(line), (0.05, 0.25, 1.0), opacity=1.0, width=4.0)
-            self.right_renderer.AddActor(actor_2d)
-            self.trajectory_actors_2d.append(actor_2d)
-
-        for line in yellow_2d:
-            actor_2d = vtk_actor(vtk_polyline(line), (1.0, 1.0, 0.0), opacity=1.0, width=4.0)
             self.right_renderer.AddActor(actor_2d)
             self.trajectory_actors_2d.append(actor_2d)
 
