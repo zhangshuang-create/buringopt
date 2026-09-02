@@ -1702,6 +1702,7 @@ def _special_boundary_geometry(
             "connector_records": [],
             "selected_void_connectors_3d": {},
             "blank_centers_3d": {},
+            "blank_region_areas": {},
             "repulsion_centers_3d": {},
             "void_center_eligibility": {},
             "periodic_pair_blocked": False,
@@ -1932,6 +1933,7 @@ def _special_boundary_geometry(
     selected_records: dict[str, list[dict[str, object]]] = {}
     selected_void_connectors_3d: dict[str, list[list[list[float]]]] = {}
     blank_centers_3d: dict[str, list[float]] = {}
+    blank_region_areas: dict[str, float] = {}
     repulsion_centers_3d: dict[str, list[float]] = {}
     void_center_eligibility: dict[str, dict[str, object]] = {}
     for side, boundary_track in raw_boundary_tracks.items():
@@ -2039,6 +2041,11 @@ def _special_boundary_geometry(
         _, _, vh = np.linalg.svd(polygon_3d - origin, full_matrices=False)
         basis = vh[:2]
         polygon_2d = (polygon_3d - origin) @ basis.T
+        # Area of the actual selected local blank loop in its PCA plane.
+        blank_region_areas[side] = float(0.5 * abs(np.sum(
+            polygon_2d[:, 0] * np.roll(polygon_2d[:, 1], -1)
+            - np.roll(polygon_2d[:, 0], -1) * polygon_2d[:, 1]
+        )))
         in_region = _points_in_polygon((triangle_centers - origin) @ basis.T, polygon_2d)
         if len(vh) >= 3:
             normal = vh[2]
@@ -2095,6 +2102,7 @@ def _special_boundary_geometry(
         "selected_connector_records": selected_records,
         "selected_void_connectors_3d": selected_void_connectors_3d,
         "blank_centers_3d": blank_centers_3d,
+        "blank_region_areas": blank_region_areas,
         "repulsion_centers_3d": repulsion_centers_3d,
         "void_center_eligibility": void_center_eligibility,
         # MODEL_BOUNDARY only closes a side that has no red boundary track.
@@ -3398,7 +3406,7 @@ def _directed_pair_force(
     delta = follower[active] - leader[nearest[active]]
     direction = delta / gap[:, None]
     error = (gap - d) / d
-    dead = np.clip(np.abs(error) / 0.04, 0.0, 1.0)
+    dead = np.clip(np.abs(error) / 0.015, 0.0, 1.0)
     dead = dead * dead * (3.0 - 2.0 * dead)
     magnitude = np.where(
         gap < d,
@@ -3870,12 +3878,14 @@ def _optimize_trajectory_region_energy(
 
     blanks: list[np.ndarray] = []
     void_depth = 0.0
+    blank_region_areas: dict[str, float] = {}
     if moving_region == "CENTER":
-        center_geometry = None
-        if blank_centers_3d is None or periodic_pair_blocked is None:
-            center_geometry = _special_boundary_geometry(
-                trajectory, d, mesh=mesh
-            )
+        center_geometry = _special_boundary_geometry(
+            trajectory, d, mesh=mesh
+        )
+        blank_region_areas = dict(
+            center_geometry.get("blank_region_areas", {})
+        )
         fixed_blank_centers = blank_centers_3d
         if fixed_blank_centers is None:
             fixed_blank_centers = center_geometry.get(
@@ -3939,6 +3949,16 @@ def _optimize_trajectory_region_energy(
             void_gain = (
                 attract_weight * (1.0 + depth_excess ** 1.2)
             )
+            if blank_region_areas:
+                largest_area = max(
+                    max(float(area), 0.0)
+                    for area in blank_region_areas.values()
+                )
+                half_area = math.pi * d * d
+                area_factor = largest_area / max(
+                    largest_area + half_area, EPS
+                )
+                void_gain *= area_factor
             void_force = _blank_guidance_force(
                 P, blanks, d, R, void_gain
             )
@@ -4054,8 +4074,8 @@ def _optimize_trajectory_region_energy(
             for follower in range(1, num_lines - 1):
                 if follower in anchor_indices:
                     continue
-                apply_follower(follower, follower - 1, gain=0.5)
-                apply_follower(follower, follower + 1, gain=0.5)
+                apply_follower(follower, follower - 1, gain=0.8)
+                apply_follower(follower, follower + 1, gain=0.8)
 
         # Smooth both ordinary forces and green-center attraction. Previously
         # the latter bypassed smoothing and created pointwise kinks.
