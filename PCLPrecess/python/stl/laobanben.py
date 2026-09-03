@@ -1,4 +1,4 @@
-#带优化的自适应优化、目前最优
+#带优化的自适应优化、目前最优,zhege时老版本的代码（力的公式时老式的）
 from __future__ import annotations
 
 import argparse
@@ -2517,6 +2517,7 @@ def apply_tangent_circle_fillet(
         center_boundary_limit: float | None = None,
         project_fillet_to_mesh: bool = False,
         arc_lock_guard_d: float = 2.0,
+        arc_speed_loss_pct: float = 0.0,
 ) -> List[TrajectorySegment]:
     """
     倒圆与精准投影：
@@ -2528,6 +2529,9 @@ def apply_tangent_circle_fillet(
     """
     if speed <= 0.0 or a_max <= 0.0 or j_max <= 0.0:
         raise ValueError("speed, a_max, and j_max must all be positive")
+    arc_speed_loss_pct = float(arc_speed_loss_pct)
+    if not np.isfinite(arc_speed_loss_pct) or not 0.0 <= arc_speed_loss_pct <= 100.0:
+        raise ValueError("arc_speed_loss_pct must be between 0 and 100")
 
     R_a = (speed ** 2) / a_max
     R_j = math.sqrt((speed ** 3) / j_max)
@@ -2745,6 +2749,7 @@ def apply_tangent_circle_fillet(
 
                     fillet_meta = dict(meta)
                     fillet_meta["locked_mask"] = locked_mask.tolist()
+                    fillet_meta["arc_speed_scale"] = 1.0 - arc_speed_loss_pct / 100.0
                     raw_filleted.append(TrajectorySegment(
                         kind="SURFACE_SCAN",
                         uv=np.full((len(curve_3d), 2), np.nan),
@@ -2946,6 +2951,7 @@ def apply_tangent_circle_fillet(
 
         fillet_meta = dict(meta)
         fillet_meta["locked_mask"] = locked_mask.tolist()
+        fillet_meta["arc_speed_scale"] = 1.0 - arc_speed_loss_pct / 100.0
         raw_filleted.append(TrajectorySegment(
             kind="SURFACE_SCAN",
             uv=np.full((len(final_xyz), 2), np.nan),
@@ -4962,18 +4968,58 @@ def _export_matrix_trajectory(
     print(f"Saved matrix trajectory: {path}")
 
 
+def _remove_intersecting_boundary_tracks(
+        trajectory: Sequence[TrajectorySegment], tolerance: float = 1.0) -> list[TrajectorySegment]:
+    """Use C0/Cn short-circuit chains to remove intersecting boundaries."""
+    centers = [s for s in trajectory if s.kind == "SURFACE_SCAN" and str(getattr(s, "region", "")).upper() == "CENTER"]
+    if not centers:
+        return list(trajectory)
+
+    def hit(a0, a1, b0, b1):
+        u, v = np.asarray(a1, float) - a0, np.asarray(b1, float) - b0
+        w = np.asarray(a0, float) - b0
+        aa, bb, cc = float(u @ u), float(u @ v), float(v @ v)
+        dd, ee = float(u @ w), float(v @ w)
+        if aa < EPS or cc < EPS:
+            return float(np.linalg.norm(np.asarray(a0) - np.asarray(b0))) <= tolerance
+        den = aa * cc - bb * bb
+        s = 0.0 if abs(den) < EPS else (bb * ee - cc * dd) / den
+        s = float(np.clip(s, 0.0, 1.0))
+        t = float(np.clip((bb * s + ee) / cc, 0.0, 1.0))
+        s = float(np.clip((bb * t - dd) / aa, 0.0, 1.0))
+        return float(np.linalg.norm(np.asarray(a0) + s * u - (np.asarray(b0) + t * v))) <= tolerance
+
+    def intersects(center, boundary):
+        cp, bp = np.asarray(center.xyz, float), np.asarray(boundary.xyz, float)
+        return any(hit(a0, a1, b0, b1) for a0, a1 in zip(cp[:-1], cp[1:]) for b0, b1 in zip(bp[:-1], bp[1:]))
+
+    endpoints = [centers[0], centers[-1]] if len(centers) > 1 else [centers[0]]
+    remove_ids: set[int] = set()
+    for region in ("LOWER", "UPPER"):
+        candidates = [(i, s) for i, s in enumerate(trajectory)
+                      if s.kind == "SURFACE_SCAN" and str(getattr(s, "region", "")).upper() == region and len(s.xyz) >= 2]
+        for center in endpoints:
+            ranked = sorted(candidates, key=lambda item: float(np.mean(cKDTree(np.asarray(item[1].xyz, float)).query(np.asarray(center.xyz, float))[0])))[:4]
+            for idx, boundary in ranked:
+                if not intersects(center, boundary):
+                    break
+                remove_ids.add(idx)
+    return [s for i, s in enumerate(trajectory) if i not in remove_ids]
+
+
 def _export_paq_trajectory(
-        path: Path,
-        mesh: trimesh.Trimesh,
-        segments: Sequence[TrajectorySegment],
-        speed: float,
-        spray_distance: float,
+    path: Path,
+    mesh: trimesh.Trimesh,
+    segments: Sequence[TrajectorySegment],
+    speed: float,
+    spray_distance: float,
+    arc_speed_loss_pct: float = 0.0,
 ) -> None:
     point_segments = [
-        (segment, xyz)
+        (segment, xyz, local_idx)
         for segment in segments
         if len(segment.xyz)
-        for xyz in segment.xyz
+        for local_idx, xyz in enumerate(segment.xyz)
     ]
     if not point_segments:
         path.write_text("", encoding="utf-8")
@@ -4981,32 +5027,21 @@ def _export_paq_trajectory(
 
     surface_points = np.asarray([item[1] for item in point_segments], dtype=float)
     closest, _, face_ids = trimesh.proximity.closest_point(mesh, surface_points)
-    normals = np.asarray(mesh.face_normals, dtype=float)[np.asarray(face_ids, dtype=np.int64)]
+    normals = np.asarray(mesh.face_normals, dtype=float)[
+        np.asarray(face_ids, dtype=np.int64)
+    ]
     inward_normals = -normals
 
-    # 位置点偏置使用指向外部的正常面法向 normals
-    # Keep free-space transition points in free space.  Only spray-on surface
-    # points receive projection and spray-distance offset.
     export_points = surface_points.copy()
     surface_mask = np.asarray(
-        [segment.kind == "SURFACE_SCAN" for segment, _ in point_segments],
+        [segment.kind == "SURFACE_SCAN" for segment, _, _ in point_segments],
         dtype=bool,
     )
-    # Keep the fitted trajectory itself, especially its exact open-boundary
-    # endpoints.  Replacing every point by closest-point coordinates can pull
-    # a valid boundary point back into the mesh.  Only apply the requested gun
-    # offset along the normal.
-    export_points[surface_mask] = (
-        surface_points[surface_mask] + normals[surface_mask] * float(spray_distance)
-    )
+    export_points[surface_mask] = surface_points[surface_mask] + normals[
+        surface_mask
+    ] * float(spray_distance)
 
-    # =========================================================================
-    # 核心修改：分段计算切向，并根据 Z 轴走向将方向统一朝上（Z 轴正方向）
-    # =========================================================================
-    # 1. 统计每个有效段的点数
     segment_lengths = [len(seg.xyz) for seg in segments if len(seg.xyz) > 0]
-
-    # 2. 将扁平化的 export_points 重新切分为与原 segment 一一对应的子数组
     split_indices = np.cumsum(segment_lengths)[:-1]
     segment_export_points = np.split(export_points, split_indices)
 
@@ -5016,43 +5051,61 @@ def _export_paq_trajectory(
         if n_pts == 0:
             continue
 
-        # 初始化当前段的切向数组
         t = np.empty_like(pts)
         if n_pts == 1:
             t[0] = np.array([1.0, 0.0, 0.0])
         else:
-            # 基础切向计算（底层、中层、顶层点逻辑）
             t[0] = pts[1] - pts[0]
             t[-1] = pts[-1] - pts[-2]
             t[1:-1] = pts[2:] - pts[:-2]
 
-            # 统一方向判定：若该段终点比起点矮（dz < 0，即物理向下行进），
-            # 则反转其所有点的切向，使其指向不变（即下一个点指向前一个点，依然朝上）
             dz = pts[-1, 2] - pts[0, 2]
             if dz < 0:
                 t = -t
 
         segment_tangents.append(t)
 
-    # 3. 将各段切向重新合并为与 export_points 一一对应的数组
     tangents = np.vstack(segment_tangents)
-    # =========================================================================
 
     cumulative = np.zeros(len(export_points), dtype=float)
     if len(export_points) > 1:
-        cumulative[1:] = np.cumsum(np.linalg.norm(export_points[1:] - export_points[:-1], axis=1))
+        cumulative[1:] = np.cumsum(
+            np.linalg.norm(export_points[1:] - export_points[:-1], axis=1)
+        )
+
+    # 计算圆弧段折减后的速度比例
+    loss_factor = max(0.0, 1.0 - (float(arc_speed_loss_pct) / 100.0))
+    base_speed = float(speed)
+    arc_speed = base_speed * loss_factor
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as stream:
-        for point, tangent, normal, distance in zip(export_points, tangents, inward_normals, cumulative):
+        for (segment, _, local_idx), point, tangent, normal, distance in zip(
+            point_segments, export_points, tangents, inward_normals, cumulative
+        ):
+            # 判断当前采样点是否处于圆弧段
+            is_arc = False
+            note = getattr(segment, "note", "")
+            if any(k in note for k in ("Fillet", "Spatial Arc", "SEAM_BLEND_3D")):
+                meta = getattr(segment, "geometry_meta", None)
+                if isinstance(meta, dict) and "locked_mask" in meta:
+                    mask = meta["locked_mask"]
+                    if local_idx < len(mask):
+                        is_arc = bool(mask[local_idx])
+                    else:
+                        is_arc = True
+                else:
+                    is_arc = True
+
+            current_pt_speed = arc_speed if is_arc else base_speed
+
             quat = _orientation_quaternion(tangent, normal)
             stream.write(
                 f"{point[0]:.3f} {point[1]:.3f} {point[2]:.3f} "
                 f"{quat[0]:.3f} {quat[1]:.3f} {quat[2]:.3f} {quat[3]:.3f} "
-                f"{float(speed):.3f} 0.000 {distance:.6f} 0 {float(spray_distance):.3f}\n"
+                f"{current_pt_speed:.3f} 0.000 {distance:.6f} 0 {float(spray_distance):.3f}\n"
             )
-    print(f"Saved PAQ trajectory: {path}")
-
+    print(f"Saved PAQ trajectory: {path} (圆弧速度损失设定: {arc_speed_loss_pct:.1f}%)")
 
 def _read_obj_cut_edges(path: Path, uv_tolerance: float = 1.0e-8) -> np.ndarray:
     vertices = []
@@ -5385,6 +5438,7 @@ class InteractiveVisualizer:
         self.current_metadata: dict[str, object] | None = None
         self.a_max = 1000.0  # 默认值
         self.j_max = 5000.0  # 默认值
+        self.arc_speed_loss_pct = 0.0
         self.hide_model = False
         self.hide_traj = False
 
@@ -5761,14 +5815,18 @@ class TkControlPanel:
         )
         self.arc_lock_guard_entry.grid(row=5, column=1, padx=10, pady=6, sticky="ew")
 
+        tk.Label(self.root, text="圆弧速度损失 (%): ", font=("Arial", 11)).grid(row=6, column=0, padx=10, pady=6, sticky="w")
+        self.arc_speed_loss_var = tk.StringVar(value="0")
+        tk.Entry(self.root, textvariable=self.arc_speed_loss_var, width=15, font=("Arial", 11)).grid(row=6, column=1, padx=10, pady=6, sticky="ew")
+
         # 原有的按钮行号下移
         self.btn = tk.Button(self.root, text="更新轨迹", command=self.update_spacing, font=("Arial", 11), bg="#1948CD",
                              fg="white")
-        self.btn.grid(row=6, column=0, padx=10, pady=5, sticky="ew")
+        self.btn.grid(row=7, column=0, padx=10, pady=5, sticky="ew")
 
         self.export_btn = tk.Button(self.root, text="导出轨迹", command=self.export_trajectory, font=("Arial", 11),
                                     bg="#1948CD", fg="white")
-        self.export_btn.grid(row=6, column=1, padx=10, pady=5, sticky="ew")
+        self.export_btn.grid(row=7, column=1, padx=10, pady=5, sticky="ew")
 
         # Show/Hide checkboxes
         self.hide_model_var = tk.BooleanVar(value=False)
@@ -5776,14 +5834,14 @@ class TkControlPanel:
             self.root, text="隐藏三维网格模型", variable=self.hide_model_var, command=self.toggle_model,
             font=("Arial", 10)
         )
-        self.cb_model.grid(row=7, column=0, columnspan=2, sticky="w", padx=10, pady=2)
+        self.cb_model.grid(row=8, column=0, columnspan=2, sticky="w", padx=10, pady=2)
 
         self.hide_traj_var = tk.BooleanVar(value=False)
         self.cb_traj = tk.Checkbutton(
             self.root, text="隐藏喷涂加工轨迹", variable=self.hide_traj_var, command=self.toggle_traj,
             font=("Arial", 10)
         )
-        self.cb_traj.grid(row=8, column=0, columnspan=2, sticky="w", padx=10, pady=2)
+        self.cb_traj.grid(row=9, column=0, columnspan=2, sticky="w", padx=10, pady=2)
 
     def toggle_model(self):
         self.visualizer.hide_model = self.hide_model_var.get()
@@ -5822,12 +5880,14 @@ class TkControlPanel:
             a_max = float(self.a_max_var.get())
             j_max = float(self.j_max_var.get())
             arc_lock_guard_d = float(self.arc_lock_guard_var.get())
+            arc_speed_loss_pct = float(self.arc_speed_loss_var.get())
 
             if not np.isfinite(new_d) or new_d <= 0: raise ValueError
             if not np.isfinite(speed) or speed <= 0: raise ValueError
             if not np.isfinite(a_max) or a_max <= 0: raise ValueError
             if not np.isfinite(j_max) or j_max <= 0: raise ValueError
             if not np.isfinite(arc_lock_guard_d) or arc_lock_guard_d < 0: raise ValueError
+            if not np.isfinite(arc_speed_loss_pct) or not 0 <= arc_speed_loss_pct <= 100: raise ValueError
 
         except ValueError:
             messagebox.showerror("错误", "参数必须为大于 0 的有效数字。")
@@ -5838,6 +5898,7 @@ class TkControlPanel:
         self.visualizer.spray_distance = spray_distance
         self.visualizer.a_max = a_max
         self.visualizer.j_max = j_max
+        self.visualizer.arc_speed_loss_pct = arc_speed_loss_pct
 
         # 动力学参数打印
         R_calc = max((speed ** 2) / a_max, math.sqrt((speed ** 3) / j_max))
@@ -5873,7 +5934,10 @@ class TkControlPanel:
             target_spacing=new_d,  # main 中使用 target_spacing=selected_spacing
             sample_step=self.visualizer.sample_step,
             arc_lock_guard_d=arc_lock_guard_d,
+            arc_speed_loss_pct=arc_speed_loss_pct,
         )
+        optimized = _remove_intersecting_boundary_tracks(optimized, tolerance=max(1.0, 0.05 * new_d))
+        raw_trajectory = _remove_intersecting_boundary_tracks(raw_trajectory, tolerance=max(1.0, 0.05 * new_d))
 
         # Relax the coupled straight portions first; quintic fitting is done
         # once from the completed relaxed geometry in the worker below.
@@ -5924,7 +5988,24 @@ class TkControlPanel:
         spacing, speed, spray_distance = values
         self._store_process_values(spacing, speed, spray_distance)
 
-        if not self.visualizer.current_trajectory or self.visualizer.current_metadata is None:
+        # 读取界面输入的圆弧速度损失百分比
+        try:
+            arc_speed_loss_pct = float(self.arc_speed_loss_var.get())
+            if (
+                not np.isfinite(arc_speed_loss_pct)
+                or not 0 <= arc_speed_loss_pct <= 100
+            ):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "错误", "圆弧速度损失百分比必须是 0 到 100 之间的有效数字。"
+            )
+            return
+
+        if (
+            not self.visualizer.current_trajectory
+            or self.visualizer.current_metadata is None
+        ):
             messagebox.showerror("错误", "当前没有可导出的轨迹，请先更新轨迹。")
             return
 
@@ -5940,18 +6021,15 @@ class TkControlPanel:
             self.visualizer.current_trajectory,
             self.visualizer.trajectory_speed,
             self.visualizer.spray_distance,
+            arc_speed_loss_pct=arc_speed_loss_pct,
         )
-        matrix_path = self.visualizer.paq_path.with_name(
-            self.visualizer.paq_path.stem + "_matrix.txt"
+        messagebox.showinfo(
+            "完成",
+            f"轨迹已导出:\n{self.visualizer.paq_path}\n(圆弧段降速 {arc_speed_loss_pct:.1f}%)",
         )
-        _export_matrix_trajectory(
-            matrix_path, self.visualizer.mesh,
-            self.visualizer.current_trajectory,
-            self.visualizer.trajectory_speed,
-            self.visualizer.spray_distance,
+        print(
+            f"Exported PAQ trajectory with {arc_speed_loss_pct:.1f}% arc speed reduction: {self.visualizer.paq_path}"
         )
-        messagebox.showinfo("完成", f"轨迹已导出:\n{self.visualizer.paq_path}")
-        print(f"Exported PAQ trajectory: {self.visualizer.paq_path}")
 
 
 def tick_tkinter(obj, event, tk_panel: TkControlPanel):
