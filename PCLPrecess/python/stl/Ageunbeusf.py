@@ -828,7 +828,7 @@ def trace_straight_seam(
 
 
 def _precut_two_boundaries(
-        mesh: trimesh.Trimesh,
+    mesh: trimesh.Trimesh,
 ) -> tuple[trimesh.Trimesh, PrecutSeam | None]:
     """Cut a two-boundary mesh along loft's shorter three-point-plane curve by remeshing intersected triangles."""
     faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -838,13 +838,12 @@ def _precut_two_boundaries(
 
     boundary_loops = extract_boundary_loops(mesh)
     top, bottom = classify_top_bottom_boundaries(boundary_loops)
-    _, pca_axes, _ = compute_pca(top.points)
-    pca_second_direction = pca_axes[1]
-    try:
-        third_point = _upper_boundary_contact_point(top)
-    except Exception:
-        third_point = _upper_boundary_pca_second_point(top, pca_second_direction)
-    plane = build_reference_plane(top.center, bottom.center, third_point)
+
+    # 建立切割参考平面
+    upper_pca_center, upper_pca_axes, _ = compute_pca(top.points)
+    green_axis = _unit(upper_pca_axes[1], "upper-boundary PCA green axis")
+    third_point = upper_pca_center + green_axis
+    plane = build_reference_plane(upper_pca_center, bottom.center, third_point)
 
     curves = [
         np.asarray(curve, dtype=float)
@@ -852,7 +851,9 @@ def _precut_two_boundaries(
         if len(curve) >= 2 and _polyline_length(curve) > EPS
     ]
     if len(curves) < 2:
-        raise ValueError("The loft three-point plane produced fewer than two usable intersections.")
+        raise ValueError(
+            "The loft three-point plane produced fewer than two usable intersections."
+        )
 
     main_curves = sorted(curves, key=_polyline_length, reverse=True)[:2]
     curve_lengths = [_polyline_length(curve) for curve in main_curves]
@@ -863,24 +864,24 @@ def _precut_two_boundaries(
     bottom_ids = np.asarray(bottom.vertex_indices, dtype=np.int64)
     top_ids = np.asarray(top.vertex_indices, dtype=np.int64)
 
-    forward_cost = (
-            np.min(np.linalg.norm(vertices[bottom_ids] - selected[0], axis=1))
-            + np.min(np.linalg.norm(vertices[top_ids] - selected[-1], axis=1))
-    )
-    reverse_cost = (
-            np.min(np.linalg.norm(vertices[bottom_ids] - selected[-1], axis=1))
-            + np.min(np.linalg.norm(vertices[top_ids] - selected[0], axis=1))
-    )
+    forward_cost = np.min(
+        np.linalg.norm(vertices[bottom_ids] - selected[0], axis=1)
+    ) + np.min(np.linalg.norm(vertices[top_ids] - selected[-1], axis=1))
+    reverse_cost = np.min(
+        np.linalg.norm(vertices[bottom_ids] - selected[-1], axis=1)
+    ) + np.min(np.linalg.norm(vertices[top_ids] - selected[0], axis=1))
     if reverse_cost < forward_cost:
         selected = selected[::-1].copy()
 
-    # Remeshing Process
+    # 统计网格尺寸与尺度自适应容差
     edges = mesh_edges_from_faces(faces)
     edge_lengths = np.linalg.norm(vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1)
     typical_edge = float(np.median(edge_lengths)) if len(edge_lengths) > 0 else 1.0
 
+    model_scale = max(float(np.linalg.norm(np.ptp(vertices, axis=0))), 1.0)
+    adaptive_eps = max(1e-7 * model_scale, 1e-6)
+
     dense_curve = _dense_polyline_samples(selected, 0.2 * typical_edge)
-    from scipy.spatial import cKDTree
     tree = cKDTree(dense_curve)
     tri_centers = vertices[faces].mean(axis=1)
     dists, _ = tree.query(tri_centers)
@@ -890,19 +891,25 @@ def _precut_two_boundaries(
     edge_cut_cache = {}
     plane_edges = set()
 
-    bottom_edges_set = {(min(a, b), max(a, b)) for a, b in zip(bottom_ids, np.roll(bottom_ids, -1))}
-    top_edges_set = {(min(a, b), max(a, b)) for a, b in zip(top_ids, np.roll(top_ids, -1))}
+    bottom_edges_set = {
+        (min(a, b), max(a, b)) for a, b in zip(bottom_ids, np.roll(bottom_ids, -1))
+    }
+    top_edges_set = {
+        (min(a, b), max(a, b)) for a, b in zip(top_ids, np.roll(top_ids, -1))
+    }
 
     new_bottom_vertices = set(bottom_ids)
     new_top_vertices = set(top_ids)
 
+    # 采用尺度自适应容差清零距离
     s_all = vertices @ plane.normal + plane.d
-    s_all[np.abs(s_all) < 1.0e-9] = 0.0
+    s_all[np.abs(s_all) < adaptive_eps] = 0.0
 
+    # 1. 剖分与重网格化（放宽筛选阈值至 2.5 * typical_edge 以防漏切）
     for f_idx, face in enumerate(faces):
         dist = dists[f_idx]
         s = s_all[face]
-        is_near = dist < 1.5 * typical_edge
+        is_near = dist < 2.5 * typical_edge
 
         if not is_near:
             new_faces.append(face.tolist())
@@ -912,7 +919,7 @@ def _precut_two_boundaries(
                     plane_edges.add((min(u, v), max(u, v)))
             continue
 
-        zero_mask = (s == 0.0)
+        zero_mask = s == 0.0
         num_zeros = np.sum(zero_mask)
 
         if num_zeros == 3:
@@ -931,7 +938,7 @@ def _precut_two_boundaries(
             v_zero_local = np.where(zero_mask)[0][0]
             v_other_local = [(v_zero_local + 1) % 3, (v_zero_local + 2) % 3]
             s_other = s[v_other_local]
-            if s_other[0] * s_other[1] < -1e-9:
+            if s_other[0] * s_other[1] < -adaptive_eps:
                 u0 = face[v_other_local[0]]
                 u1 = face[v_other_local[1]]
                 u2 = face[v_zero_local]
@@ -1013,26 +1020,71 @@ def _precut_two_boundaries(
             plane_edges.add((min(p1_idx, p2_idx), max(p1_idx, p2_idx)))
 
     new_vertices_arr = np.array(new_vertices, dtype=float)
-    seam_path = trace_straight_seam(
-        plane_edges, new_bottom_vertices, new_top_vertices,
-        new_vertices_arr, selected[0], selected[-1]
-    )
 
-    remeshed_mesh = trimesh.Trimesh(
-        vertices=new_vertices_arr,
-        faces=np.array(new_faces, dtype=np.int64),
-        process=False
-    )
+    # 2. 尝试基于平面重剖分边追踪路径
+    seam_path = []
+    try:
+        seam_path = trace_straight_seam(
+            plane_edges,
+            new_bottom_vertices,
+            new_top_vertices,
+            new_vertices_arr,
+            selected[0],
+            selected[-1],
+        )
+    except Exception as e:
+        warnings.warn(f"Direct seam tracing encountered: {e}")
 
+    # 3. 兜底回退保护机制：若平面相交边图断开，回退至全局网格图最短路径搜索
+    if len(seam_path) < 2:
+        warnings.warn(
+            "Plane remeshing failed to form a connected seam path. "
+            "Falling back to original mesh surface graph shortest path."
+        )
+        mesh_adj = {}
+        for u, v in mesh_edges_from_faces(faces):
+            mesh_adj.setdefault(u, []).append(v)
+            mesh_adj.setdefault(v, []).append(u)
+
+        start_v = int(
+            bottom_ids[
+                np.argmin(np.linalg.norm(vertices[bottom_ids] - selected[0], axis=1))
+            ]
+        )
+        end_v = int(
+            top_ids[np.argmin(np.linalg.norm(vertices[top_ids] - selected[-1], axis=1))]
+        )
+
+        seam_path = dijkstra_path(mesh_adj, start_v, end_v, vertices)
+        if len(seam_path) < 2:
+            raise ValueError(
+                "Failed to find a valid connected path between boundaries on the mesh."
+            )
+
+        remeshed_mesh = mesh
+    else:
+        remeshed_mesh = trimesh.Trimesh(
+            vertices=new_vertices_arr,
+            faces=np.array(new_faces, dtype=np.int64),
+            process=False,
+        )
+
+    # 4. 执行实际切缝
     original_vertex_count = len(remeshed_mesh.vertices)
     cut_mesh, _ = _cut_along_path(remeshed_mesh, np.array(seam_path, dtype=np.int64))
 
     seam_data = PrecutSeam(
         original_vertex_ids=np.asarray(seam_path, dtype=np.int64),
-        cut_vertex_pairs=np.column_stack([
-            seam_path,
-            np.arange(original_vertex_count, original_vertex_count + len(seam_path), dtype=np.int64),
-        ]),
+        cut_vertex_pairs=np.column_stack(
+            [
+                seam_path,
+                np.arange(
+                    original_vertex_count,
+                    original_vertex_count + len(seam_path),
+                    dtype=np.int64,
+                ),
+            ]
+        ),
         xyz=remeshed_mesh.vertices[seam_path].copy(),
     )
 
@@ -1051,7 +1103,6 @@ def _precut_two_boundaries(
         f"{_polyline_length(remeshed_mesh.vertices[seam_path]):.6g}."
     )
     return cut_mesh, seam_data
-
 
 def _save_precut_seam(input_obj: Path, seam: PrecutSeam | None) -> Path | None:
     """Persist the main seam correspondence before OptCuts can add more cuts."""
