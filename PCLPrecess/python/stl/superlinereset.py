@@ -4446,8 +4446,16 @@ def _request_spacing(
     if result is None:
         return None, None, None
 
-    spacing, a_max, j_max = result
-    return spacing, a_max, j_max
+    if isinstance(result, dict):
+        try:
+            return float(result["d"]), float(result["a_max"]), float(result["j_max"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Spacing dialog returned incomplete trajectory limits.") from exc
+    try:
+        spacing, a_max, j_max = result
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Spacing dialog returned an unsupported result.") from exc
+    return float(spacing), float(a_max), float(j_max)
 
 
 def _play_iteration_animation(mesh: trimesh.Trimesh, result_obj: Path) -> None:

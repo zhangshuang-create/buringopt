@@ -210,9 +210,11 @@ def _add_visibility_controls(
     interactor._visibility_callback = on_left_button
 
 
-def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, planning_frame=None, initial_a_max=1000.0,
-                    initial_j_max=5000.0):
-    """Preview the mapped result and wait for nominal spacing, a_max, and j_max confirmation."""
+def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, planning_frame=None,
+                    initial_speed=300.0, initial_spray_distance=0.0,
+                    initial_a_max=1000.0, initial_j_max=5000.0,
+                    initial_arc_lock_guard_d=2.0, initial_arc_speed_loss_pct=0.0):
+    """Preview the mapped result and collect all trajectory parameters."""
     vtk, _, _ = _vtk()
     view3d, view2d = vtk.vtkRenderer(), vtk.vtkRenderer()
     vertices, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
@@ -243,8 +245,12 @@ def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, plannin
 
     state = {
         "d": {"text": f"{float(initial_spacing):g}", "editing": False, "error": ""},
+        "speed": {"text": f"{float(initial_speed):g}", "editing": False, "error": ""},
+        "spray_distance": {"text": f"{float(initial_spray_distance):g}", "editing": False, "error": ""},
         "a_max": {"text": f"{float(initial_a_max):g}", "editing": False, "error": ""},
         "j_max": {"text": f"{float(initial_j_max):g}", "editing": False, "error": ""},
+        "arc_lock_guard_d": {"text": f"{float(initial_arc_lock_guard_d):g}", "editing": False, "error": ""},
+        "arc_speed_loss_pct": {"text": f"{float(initial_arc_speed_loss_pct):g}", "editing": False, "error": ""},
         "active": "d",
         "accepted": None,
     }
@@ -263,14 +269,18 @@ def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, plannin
         view2d.AddActor2D(actor)
         return actor
 
-    input_d = create_input_actor(0.085)
-    input_a = create_input_actor(0.045)
-    input_j = create_input_actor(0.005)
+    input_d = create_input_actor(0.27)
+    input_speed = create_input_actor(0.225)
+    input_spray = create_input_actor(0.18)
+    input_a = create_input_actor(0.135)
+    input_j = create_input_actor(0.09)
+    input_guard = create_input_actor(0.045)
+    input_loss = create_input_actor(0.0)
 
     button = vtk.vtkTextActor()
     button.SetInput("Generate")
     button.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
-    button.SetPosition(0.34, 0.045)
+    button.SetPosition(0.34, 0.29)
     button.GetTextProperty().SetFontSize(22)
     button.GetTextProperty().SetColor(1.0, 1.0, 1.0)
     button.GetTextProperty().SetBackgroundColor(0.10, 0.45, 0.75)
@@ -278,9 +288,19 @@ def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, plannin
     button.GetTextProperty().SetFrame(True)
     view2d.AddActor2D(button)
 
+    labels = {
+        "d": "d: ", "speed": "speed: ", "spray_distance": "spray_distance: ",
+        "a_max": "a_max: ", "j_max": "j_max: ",
+        "arc_lock_guard_d": "arc_guard: ", "arc_speed_loss_pct": "arc_loss_%: ",
+    }
+
     def refresh():
-        labels = {"d": "d: ", "a_max": "a_max: ", "j_max": "j_max: "}
-        for key, actor in [("d", input_d), ("a_max", input_a), ("j_max", input_j)]:
+        actors = [
+            ("d", input_d), ("speed", input_speed), ("spray_distance", input_spray),
+            ("a_max", input_a), ("j_max", input_j),
+            ("arc_lock_guard_d", input_guard), ("arc_speed_loss_pct", input_loss),
+        ]
+        for key, actor in actors:
             s = state[key]
             suffix = f"  [{s['error']}]" if s["error"] else ""
             is_active = (state["active"] == key)
@@ -293,24 +313,29 @@ def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, plannin
         window.Render()
 
     def accept():
-        errors = {"d": "", "a_max": "", "j_max": ""}
+        errors = {key: "" for key in labels}
         vals = {}
-        for key in ["d", "a_max", "j_max"]:
+        for key in labels:
             try:
                 val = float(state[key]["text"])
-                if not np.isfinite(val) or val <= 0.0:
+                minimum = 0.0 if key in ("spray_distance", "arc_lock_guard_d", "arc_speed_loss_pct") else 0.0
+                if not np.isfinite(val) or val < minimum:
                     raise ValueError("Must be > 0")
+                if key in ("d", "speed", "a_max", "j_max") and val <= 0.0:
+                    raise ValueError("Must be > 0")
+                if key == "arc_speed_loss_pct" and val > 100.0:
+                    raise ValueError("Must be <= 100")
                 vals[key] = val
             except ValueError:
                 errors[key] = "Invalid"
 
         if any(errors.values()):
-            for key in ["d", "a_max", "j_max"]:
+            for key in labels:
                 state[key]["error"] = errors[key]
             refresh()
             return
 
-        state["accepted"] = (vals["d"], vals["a_max"], vals["j_max"])
+        state["accepted"] = vals
         interactor.TerminateApp()
 
     def on_key(caller, _event):
@@ -327,9 +352,9 @@ def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, plannin
             accept();
             return
         if key == "Tab":
-            order = ["d", "a_max", "j_max"]
+            order = list(labels)
             idx = order.index(active_key)
-            state["active"] = order[(idx + 1) % 3]
+            state["active"] = order[(idx + 1) % len(order)]
             refresh();
             return
 
@@ -361,7 +386,12 @@ def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, plannin
                 return True
             return False
 
-        if check_click(0.085, "d") or check_click(0.045, "a_max") or check_click(0.005, "j_max"):
+        input_positions = [
+            (0.27, "d"), (0.225, "speed"), (0.18, "spray_distance"),
+            (0.135, "a_max"), (0.09, "j_max"), (0.045, "arc_lock_guard_d"),
+            (0.0, "arc_speed_loss_pct"),
+        ]
+        if any(check_click(y_pos, key) for y_pos, key in input_positions):
             refresh();
             return
 
@@ -370,7 +400,8 @@ def request_spacing(mesh, uv, uv_faces, initial_spacing, cut_edges=None, plannin
 
     interactor.AddObserver("KeyPressEvent", on_key, 1.0)
     interactor.AddObserver("LeftButtonPressEvent", on_click, 1.0)
-    interactor._spacing_callbacks = (on_key, on_click, input_d, input_a, input_j, button)
+    interactor._spacing_callbacks = (on_key, on_click, input_d, input_speed, input_spray,
+                                     input_a, input_j, input_guard, input_loss, button)
     refresh()
     interactor.Initialize();
     interactor.Start()

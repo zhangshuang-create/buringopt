@@ -3034,6 +3034,10 @@ def _request_spacing(
     )
     if result is None:
         return None, frame
+    if isinstance(result, dict):
+        result = result.get("d")
+        if result is None:
+            raise ValueError("Spacing dialog returned no spacing value.")
     if isinstance(result, (tuple, list, np.ndarray)):
         if not len(result):
             return None, frame

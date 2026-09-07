@@ -110,6 +110,89 @@ def show_result_with_vtk(result_obj: Path) -> None:
     if texture_coordinates is None:
         raise ValueError("The OptCuts result does not contain UV coordinates.")
 
+    # A cut in the OptCuts output is represented by a boundary edge: after
+    # cutting, the edge belongs to only one triangle.  Build a matching line
+    # overlay for the geometric and UV views from those single-use edges.
+    edge_use_count: dict[tuple[int, int], int] = {}
+    polys = result_mesh.GetPolys()
+    polys.InitTraversal()
+    cell_ids = vtk.vtkIdList()
+    while polys.GetNextCell(cell_ids):
+        ids = [cell_ids.GetId(i) for i in range(cell_ids.GetNumberOfIds())]
+        for index, first in enumerate(ids):
+            second = ids[(index + 1) % len(ids)]
+            edge = (min(first, second), max(first, second))
+            edge_use_count[edge] = edge_use_count.get(edge, 0) + 1
+    boundary_edges = [edge for edge, count in edge_use_count.items() if count == 1]
+
+    # Keep only duplicated geometric boundary edges.  The original open
+    # border is also a single-use edge, while a cut has two UV copies at the
+    # same 3D location.  Rounding makes the comparison robust to OBJ output
+    # precision while retaining the original vertex IDs for each overlay.
+    def point_key(point: tuple[float, float, float]) -> tuple[float, float, float]:
+        return tuple(round(float(value), 8) for value in point)
+
+    geometric_edge_uvs: dict[
+        tuple[tuple[float, float, float], tuple[float, float, float]],
+        set[tuple[tuple[float, float], tuple[float, float]]],
+    ] = {}
+    for first, second in boundary_edges:
+        first_xyz = point_key(result_mesh.GetPoint(first))
+        second_xyz = point_key(result_mesh.GetPoint(second))
+        endpoints = sorted((first_xyz, second_xyz))
+        geometric_key = (endpoints[0], endpoints[1])
+        first_uv = texture_coordinates.GetTuple2(first)
+        second_uv = texture_coordinates.GetTuple2(second)
+        uv_endpoints = tuple(sorted((
+            tuple(round(float(value), 8) for value in first_uv),
+            tuple(round(float(value), 8) for value in second_uv),
+        )))
+        geometric_edge_uvs.setdefault(geometric_key, set()).add(uv_endpoints)
+    cut_edges = []
+    for edge in boundary_edges:
+        first, second = edge
+        endpoints = sorted((point_key(result_mesh.GetPoint(first)), point_key(result_mesh.GetPoint(second))))
+        geometric_key = (endpoints[0], endpoints[1])
+        # A real cut has coincident 3D edges with distinct UV coordinates.
+        if len(geometric_edge_uvs[geometric_key]) > 1:
+            cut_edges.append(edge)
+
+    def make_edge_overlay(use_uv_coordinates: bool) -> vtk.vtkPolyData:
+        overlay = vtk.vtkPolyData()
+        points = vtk.vtkPoints()
+        points.SetNumberOfPoints(result_mesh.GetNumberOfPoints())
+        for point_index in range(result_mesh.GetNumberOfPoints()):
+            if use_uv_coordinates:
+                u, v = texture_coordinates.GetTuple2(point_index)
+                points.SetPoint(point_index, u, v, 0.002)
+            else:
+                points.SetPoint(point_index, result_mesh.GetPoint(point_index))
+        overlay.SetPoints(points)
+        lines = vtk.vtkCellArray()
+        for first, second in cut_edges:
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, first)
+            line.GetPointIds().SetId(1, second)
+            lines.InsertNextCell(line)
+        overlay.SetLines(lines)
+        return overlay
+
+    cut_mapper = vtk.vtkPolyDataMapper()
+    cut_mapper.SetInputData(make_edge_overlay(use_uv_coordinates=False))
+    cut_mapper.ScalarVisibilityOff()
+    cut_actor = vtk.vtkActor()
+    cut_actor.SetMapper(cut_mapper)
+    cut_actor.GetProperty().SetColor(1.0, 0.85, 0.05)
+    cut_actor.GetProperty().SetLineWidth(1.5)
+
+    uv_cut_mapper = vtk.vtkPolyDataMapper()
+    uv_cut_mapper.SetInputData(make_edge_overlay(use_uv_coordinates=True))
+    uv_cut_mapper.ScalarVisibilityOff()
+    uv_cut_actor = vtk.vtkActor()
+    uv_cut_actor.SetMapper(uv_cut_mapper)
+    uv_cut_actor.GetProperty().SetColor(1.0, 0.35, 0.0)
+    uv_cut_actor.GetProperty().SetLineWidth(1.5)
+
     checker_source = vtk.vtkImageCanvasSource2D()
     checker_source.SetScalarTypeToUnsignedChar()
     checker_source.SetNumberOfScalarComponents(3)
@@ -165,12 +248,14 @@ def show_result_with_vtk(result_obj: Path) -> None:
     model_renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
     model_renderer.SetBackground(0.12, 0.15, 0.19)
     model_renderer.AddActor(model_actor)
+    model_renderer.AddActor(cut_actor)
     model_renderer.ResetCamera()
 
     uv_renderer = vtk.vtkRenderer()
     uv_renderer.SetViewport(0.5, 0.0, 1.0, 1.0)
     uv_renderer.SetBackground(0.96, 0.96, 0.96)
     uv_renderer.AddActor(uv_actor)
+    uv_renderer.AddActor(uv_cut_actor)
     uv_renderer.ResetCamera()
 
     def add_title(renderer, title: str, color: tuple[float, float, float]) -> None:

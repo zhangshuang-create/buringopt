@@ -13,6 +13,115 @@ import numpy as np
 import trimesh
 
 
+def build_uv_domain(uv: np.ndarray, uv_faces: np.ndarray):
+    """Build the valid 2-D parameter domain from UV triangles."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    uv = np.asarray(uv, dtype=float)
+    faces = np.asarray(uv_faces, dtype=np.int64)
+    if uv.ndim != 2 or uv.shape[1] != 2 or faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError("uv must have shape (N, 2) and uv_faces must have shape (M, 3).")
+    triangles = []
+    for face in faces:
+        points = uv[face]
+        polygon = Polygon(points)
+        if polygon.is_valid and polygon.area > 1.0e-14:
+            triangles.append(polygon)
+    if not triangles:
+        raise ValueError("The UV mesh contains no non-degenerate triangles.")
+    domain = unary_union(triangles).buffer(0)
+    if domain.is_empty:
+        raise ValueError("Could not construct a valid UV domain.")
+    return domain
+
+
+def _largest_axis_aligned_rectangle(domain, uv: np.ndarray, split_line=None):
+    """Find a large rectangle fully covered by *domain*.
+
+    Candidate sides come from UV coordinates.  For very dense UV meshes the
+    coordinates are reduced to at most 96 quantile samples per axis, keeping
+    the search bounded while retaining the exact boundary coordinates at the
+    extrema.
+    """
+    from shapely.geometry import LineString, box
+
+    split_geometry = None
+    if split_line is not None:
+        split_line = np.asarray(split_line, dtype=float)
+        if split_line.ndim != 2 or split_line.shape[1] != 2 or len(split_line) < 2:
+            raise ValueError("split_line must have shape (N, 2) with at least two points.")
+        split_geometry = LineString(split_line)
+        if split_geometry.is_empty or split_geometry.length <= 1.0e-14:
+            raise ValueError("split_line must have non-zero length.")
+
+    uv = np.asarray(uv, dtype=float)
+    def candidates(values):
+        values = np.unique(values[np.isfinite(values)])
+        if len(values) <= 96:
+            return values
+        samples = np.quantile(values, np.linspace(0.0, 1.0, 96))
+        return np.unique(samples)
+    xs, ys = candidates(uv[:, 0]), candidates(uv[:, 1])
+    best = None
+    best_area = 0.0
+    for left_index in range(len(xs) - 1):
+        for right_index in range(left_index + 1, len(xs)):
+            width = xs[right_index] - xs[left_index]
+            if width * (ys[-1] - ys[0]) <= best_area:
+                continue
+            for bottom_index in range(len(ys) - 1):
+                for top_index in range(bottom_index + 1, len(ys)):
+                    area = width * (ys[top_index] - ys[bottom_index])
+                    if area <= best_area:
+                        continue
+                    candidate = box(xs[left_index], ys[bottom_index], xs[right_index], ys[top_index])
+                    if domain.covers(candidate) and (
+                        split_geometry is None
+                        or candidate.boundary.intersects(split_geometry)
+                    ):
+                        best, best_area = candidate, area
+    if best is None:
+        raise ValueError("Could not find an interior rectangle in the UV domain.")
+    return best
+
+
+def decompose_uv_domain(
+    uv: np.ndarray, uv_faces: np.ndarray, split_line: np.ndarray | None = None
+) -> dict[str, object]:
+    """Return the maximum covered rectangle and non-overlapping remainder triangles.
+
+    The rectangle is selected first and is excluded from the remainder before
+    triangulation.  Every returned triangle is fully covered by the original
+    UV domain and lies outside the rectangle (within numerical tolerance).
+    """
+    from shapely.geometry import Polygon
+    from shapely.ops import triangulate
+
+    uv = np.asarray(uv, dtype=float)
+    domain = build_uv_domain(uv, uv_faces)
+    rectangle = _largest_axis_aligned_rectangle(domain, uv, split_line=split_line)
+    remainder = domain.difference(rectangle).buffer(0)
+    triangles = []
+    for piece in getattr(remainder, "geoms", [remainder]):
+        if piece.is_empty or piece.area <= 1.0e-14:
+            continue
+        for triangle in triangulate(piece):
+            if triangle.area <= 1.0e-14 or not piece.covers(triangle):
+                continue
+            coordinates = np.asarray(triangle.exterior.coords[:-1], dtype=float)
+            if len(coordinates) == 3:
+                triangles.append(coordinates)
+    return {
+        "domain": domain,
+        "rectangle": np.asarray(rectangle.exterior.coords[:-1], dtype=float),
+        "rectangle_bounds": tuple(float(value) for value in rectangle.bounds),
+        "split_line": None if split_line is None else np.asarray(split_line, dtype=float),
+        "remainder": remainder,
+        "triangles": triangles,
+    }
+
+
 # OptCut.py lives in ``PCLPrecess/python/stl``.  The OptCuts checkout is a
 # sibling of ``python`` under ``PCLPrecess``, so parents[2] is the project
 # root (parents[1] would incorrectly point at ``PCLPrecess/python``).
@@ -594,6 +703,25 @@ def _vtk_triangle_mesh(points: np.ndarray, faces: np.ndarray):
     return data
 
 
+def _vtk_polyline(points: np.ndarray, closed: bool = False):
+    import vtk
+    from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+
+    points = np.asarray(points, dtype=float)
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(points, deep=True))
+    indices = np.arange(len(points), dtype=np.int64)
+    if closed and len(indices):
+        indices = np.r_[indices, indices[0]]
+    records = np.r_[len(indices), indices].astype(np.int64)
+    cells = vtk.vtkCellArray()
+    cells.SetCells(1, numpy_to_vtkIdTypeArray(records, deep=True))
+    data = vtk.vtkPolyData()
+    data.SetPoints(vtk_points)
+    data.SetLines(cells)
+    return data
+
+
 def _vtk_add_title(renderer, text: str, color=(1.0, 1.0, 1.0)):
     import vtk
 
@@ -716,6 +844,7 @@ def _show_result(
     uv: np.ndarray,
     uv_faces: np.ndarray,
     cut_edges: np.ndarray | None = None,
+    uv_decomposition: dict[str, object] | None = None,
 ) -> None:
     """Show final 3D seams and the UV mesh in a VTK split view."""
     import vtk
@@ -773,8 +902,40 @@ def _show_result(
     uv_renderer.SetViewport(0.5, 0.0, 1.0, 1.0)
     uv_renderer.SetBackground(0.96, 0.96, 0.96)
     uv_renderer.AddActor(uv_actor)
+    if uv_decomposition is not None:
+        # Overlay the retained rectangle and the non-overlapping remainder
+        # triangles so the partition is inspectable directly in UV space.
+        rectangle = np.asarray(uv_decomposition["rectangle"], dtype=float)
+        rectangle_points = np.column_stack((rectangle, np.full(len(rectangle), 0.01)))
+        rectangle_data = _vtk_polyline(rectangle_points, closed=True)
+        rectangle_actor = vtk.vtkActor()
+        rectangle_mapper = vtk.vtkPolyDataMapper()
+        rectangle_mapper.SetInputData(rectangle_data)
+        rectangle_actor.SetMapper(rectangle_mapper)
+        rectangle_actor.GetProperty().SetColor(0.88, 0.12, 0.10)
+        rectangle_actor.GetProperty().SetLineWidth(4.0)
+        uv_renderer.AddActor(rectangle_actor)
+
+        remainder_triangles = uv_decomposition.get("triangles", [])
+        if remainder_triangles:
+            triangle_points = np.vstack([
+                np.column_stack((triangle, np.full(3, 0.008)))
+                for triangle in remainder_triangles
+            ])
+            triangle_faces = np.arange(len(triangle_points), dtype=np.int64).reshape(-1, 3)
+            remainder_mapper = vtk.vtkPolyDataMapper()
+            remainder_mapper.SetInputData(_vtk_triangle_mesh(triangle_points, triangle_faces))
+            remainder_actor = vtk.vtkActor()
+            remainder_actor.SetMapper(remainder_mapper)
+            remainder_actor.GetProperty().SetRepresentationToWireframe()
+            remainder_actor.GetProperty().SetColor(0.10, 0.55, 0.20)
+            remainder_actor.GetProperty().SetLineWidth(1.4)
+            uv_renderer.AddActor(remainder_actor)
     uv_renderer.ResetCamera()
-    _vtk_add_title(uv_renderer, "OptCuts UV mesh", (0.08, 0.08, 0.08))
+    title = "OptCuts UV mesh"
+    if uv_decomposition is not None:
+        title += " | red: max rectangle, green: remainder triangles"
+    _vtk_add_title(uv_renderer, title, (0.08, 0.08, 0.08))
 
     window = vtk.vtkRenderWindow()
     window.SetWindowName("OptCuts Final Result - VTK")
@@ -798,6 +959,7 @@ def main() -> None:
     official_input = _prepare_official_input(optcuts_mesh)
     result_obj = _run_official_optcuts(official_input)
     uv, uv_faces = _read_obj_uv(result_obj)
+    uv_decomposition = decompose_uv_domain(uv, uv_faces)
     optimized_cut_edges = _read_obj_cut_edges(result_obj)
     if len(shortest_boundary_seam) and len(optimized_cut_edges):
         cut_edges = np.vstack([shortest_boundary_seam, optimized_cut_edges])
@@ -807,8 +969,13 @@ def main() -> None:
         cut_edges = optimized_cut_edges
     print(f"Pre-cut shortest-boundary seam edges: {len(shortest_boundary_seam)}")
     print(f"Additional detected OptCuts seam edges: {len(optimized_cut_edges)}")
+    print(
+        "UV maximum rectangle bounds: "
+        f"{uv_decomposition['rectangle_bounds']}; "
+        f"remainder triangles: {len(uv_decomposition['triangles'])}"
+    )
     _play_iteration_animation(optcuts_mesh, result_obj)
-    _show_result(mesh, uv, uv_faces, cut_edges)
+    _show_result(mesh, uv, uv_faces, cut_edges, uv_decomposition)
 
 
 if __name__ == "__main__":

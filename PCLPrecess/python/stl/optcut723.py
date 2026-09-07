@@ -1,5 +1,6 @@
 from __future__ import annotations
 #723的备份，原始轨迹
+from scipy.spatial import cKDTree
 import argparse
 import csv
 import json
@@ -2649,6 +2650,25 @@ def vtk_polyline(points_array: np.ndarray) -> vtk.vtkPolyData:
     return polydata
 
 
+def _finite_polyline_parts(points_array: np.ndarray) -> list[np.ndarray]:
+    points = np.asarray(points_array, dtype=float)
+    if points.ndim != 2 or points.shape[1] < 3:
+        return []
+    finite = np.isfinite(points[:, :3]).all(axis=1)
+    parts = []
+    start = None
+    for index, valid in enumerate(finite):
+        if valid and start is None:
+            start = index
+        elif not valid and start is not None:
+            if index - start >= 2:
+                parts.append(points[start:index, :3])
+            start = None
+    if start is not None and len(points) - start >= 2:
+        parts.append(points[start:, :3])
+    return parts
+
+
 def vtk_points(points_array: np.ndarray) -> vtk.vtkPolyData:
     points = vtk.vtkPoints()
     for pt in points_array:
@@ -2684,8 +2704,8 @@ def vtk_actor(polydata: vtk.vtkPolyData, color: tuple[float, float, float], opac
     # 深度偏移（向视口摄像机前置拉伸），从根本上消除曲面共面闪烁 (Z-fighting)
     mapper.SetResolveCoincidentTopologyToPolygonOffset()
     try:
-        mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-2.0, -2.0)
-        mapper.SetResolveCoincidentTopologyLineOffsetParameters(-2.0, -2.0)
+        mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-1.0, -1.0)
+        mapper.SetResolveCoincidentTopologyLineOffsetParameters(-1.0, -1.0)
     except AttributeError:
         pass
 
@@ -2694,9 +2714,23 @@ def vtk_actor(polydata: vtk.vtkPolyData, color: tuple[float, float, float], opac
     actor.GetProperty().SetColor(*color)
     actor.GetProperty().SetOpacity(opacity)
     actor.GetProperty().SetLineWidth(width)
+    actor.GetProperty().SetRenderLinesAsTubes(False)
 
     if wireframe:
         actor.GetProperty().SetRepresentationToWireframe()
+    return actor
+
+
+def _style_trajectory_actor(actor: vtk.vtkActor, color: tuple[float, float, float]) -> vtk.vtkActor:
+    """Make trajectory geometry readable against the shaded mesh."""
+    actor.GetProperty().SetColor(*color)
+    actor.GetProperty().SetOpacity(1.0)
+    actor.GetProperty().LightingOff()
+    actor.GetProperty().SetAmbient(1.0)
+    actor.GetProperty().SetDiffuse(0.0)
+    if hasattr(actor.GetProperty(), "SetDisplayLocationToForeground"):
+        actor.GetProperty().SetDisplayLocationToForeground()
+    actor.SetForceOpaque(True)
     return actor
 
 
@@ -2800,6 +2834,10 @@ class InteractiveVisualizer:
         self.left_overlay_renderer = vtk.vtkRenderer()
         self.left_overlay_renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
         self.left_overlay_renderer.SetLayer(1)
+        # Match Aeigen: retain the mesh color buffer but disable depth testing
+        # against the mesh so the trajectory is always visible on top.
+        self.left_overlay_renderer.PreserveColorBufferOn()
+        self.left_overlay_renderer.PreserveDepthBufferOff()
         self.left_overlay_renderer.EraseOff()  # 透明背景
         # 共享 3D 摄像机（旋转/平移/缩放无缝同步）
         self.left_overlay_renderer.SetActiveCamera(self.left_renderer.GetActiveCamera())
@@ -2881,27 +2919,26 @@ class InteractiveVisualizer:
         for seg in trajectory:
             if len(seg.xyz) < 2:
                 continue
-            poly = vtk_polyline(seg.xyz)
-            if seg.kind == "SURFACE_SCAN":
-                scan_append_3d.AddInputData(poly)
-                has_scan = True
-            elif seg.kind in ("OVERTRAVEL", "SEAM_BLEND_3D"):
-                overtravel_append_3d.AddInputData(poly)
-                has_overtravel = True
+            for part in _finite_polyline_parts(seg.xyz):
+                poly = vtk_polyline(part)
+                if seg.kind == "SURFACE_SCAN":
+                    scan_append_3d.AddInputData(poly)
+                    has_scan = True
+                elif seg.kind in ("OVERTRAVEL", "SEAM_BLEND_3D"):
+                    overtravel_append_3d.AddInputData(poly)
+                    has_overtravel = True
 
         # 主喷涂轨迹：红色实心立体圆管 (半宽半径默认 0.35mm)
         if has_scan:
             scan_append_3d.Update()
-            tube_poly = vtk_tube(scan_append_3d.GetOutput(), radius=2.2, num_sides=8)
-            actor = vtk_actor(tube_poly, (0.86, 0.05, 0.08), opacity=1.0)
+            actor = _style_trajectory_actor(vtk_actor(scan_append_3d.GetOutput(), (1.0, 0.10, 0.02), opacity=1.0, width=4.5), (1.0, 0.10, 0.02))
             self.left_overlay_renderer.AddActor(actor)
             self.trajectory_actors_3d.append(actor)
 
         # 过渡空跑轨迹：绿色实心立体细管 (半径默认 0.25mm)
         if has_overtravel:
             overtravel_append_3d.Update()
-            tube_poly_ot = vtk_tube(overtravel_append_3d.GetOutput(), radius=2.2, num_sides=6)
-            actor = vtk_actor(tube_poly_ot, (0.0, 0.8, 0.0), opacity=0.85)
+            actor = _style_trajectory_actor(vtk_actor(overtravel_append_3d.GetOutput(), (0.05, 1.0, 0.08), opacity=1.0, width=4.0), (0.05, 1.0, 0.08))
             self.left_overlay_renderer.AddActor(actor)
             self.trajectory_actors_3d.append(actor)
 
@@ -2924,7 +2961,7 @@ class InteractiveVisualizer:
 
         if has_scan_2d:
             scan_append_2d.Update()
-            actor_2d = vtk_actor(scan_append_2d.GetOutput(), (0.86, 0.05, 0.08), width=2.5)
+            actor_2d = _style_trajectory_actor(vtk_actor(scan_append_2d.GetOutput(), (1.0, 0.05, 0.0), width=5.0), (1.0, 0.05, 0.0))
             self.right_renderer.AddActor(actor_2d)
             self.trajectory_actors_2d.append(actor_2d)
 
@@ -3175,6 +3212,10 @@ def _request_spacing(
     )
     if result is None:
         return None, frame
+    if isinstance(result, dict):
+        result = result.get("d")
+        if result is None:
+            raise ValueError("Spacing dialog returned no spacing value.")
     if isinstance(result, (tuple, list, np.ndarray)):
         if not len(result):
             return None, frame

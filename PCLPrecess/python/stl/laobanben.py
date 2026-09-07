@@ -3480,6 +3480,10 @@ def _optimize_trajectory_region_energy(
     best_lines = None
     evaluations_since_best = 0
     last_uniform_delta = float("nan")
+    previous_ema_metric = None
+    best_ema_metric = float("inf")
+    best_ema_lines = None
+    consecutive_rises = 0
     last_uniform_relative_delta = float("nan")
     last_uniform_threshold = float("nan")
     stop_reason = None
@@ -3816,6 +3820,14 @@ def _optimize_trajectory_region_energy(
                         small_count += 1
                     else:
                         small_count = 0
+                    if previous_ema_metric is not None and smoothed_metric > previous_ema_metric:
+                        consecutive_rises += 1
+                    else:
+                        consecutive_rises = 0
+                    previous_ema_metric = float(smoothed_metric)
+                    if smoothed_metric < best_ema_metric:
+                        best_ema_metric = float(smoothed_metric)
+                        best_ema_lines = [L.copy() for L in lines]
 
                 # 用原始 CV 保存历史最优轨迹；EMA 只用于判断是否稳定。
                 improvement_tol = (
@@ -3859,6 +3871,10 @@ def _optimize_trajectory_region_energy(
 
                 # 前面仍记录指标和历史最佳，但达到最小迭代次数后才允许停止。
                 can_stop = (it + 1) >= uniform_min_iterations
+                if can_stop and consecutive_rises >= 10:
+                    stop_reason = (f"Uniformity worsened for 10 consecutive evaluations at iteration {it + 1}; "
+                                   f"rolling back to best EMA CV={best_ema_metric:.6g}")
+                    should_stop = True
 
                 # 停止条件 1：平滑 CV 连续多次几乎不变。
                 if can_stop and small_count >= uniform_patience:
@@ -3924,6 +3940,7 @@ def _optimize_trajectory_region_energy(
                 energy_components["uniform_relative_tol"] = uniform_rel_tol
                 energy_components["uniform_threshold"] = last_uniform_threshold
                 energy_components["uniform_stable_count"] = small_count
+                energy_components["uniform_consecutive_rises"] = consecutive_rises
                 energy_components["uniform_patience"] = uniform_patience
                 if uniform_metric_current is not None:
                     energy_components["uniform_metric_current"] = uniform_metric_current
@@ -3958,6 +3975,8 @@ def _optimize_trajectory_region_energy(
     # 如果开启了 return_best_uniform，则返回历史最优版本
     if uniform_stop and return_best_uniform and best_lines is not None:
         lines = best_lines
+    if stop_reason is not None and best_ema_lines is not None:
+        lines = best_ema_lines
 
     out = list(trajectory)
 
@@ -4045,6 +4064,10 @@ def optimize_center_trajectories_dual_blank_energy(
     outer_ema_stable_count = 0
     outer_ema_patience = max(1, int(kwargs.get("uniform_patience", 4)))
     outer_ema_stop_requested = False
+    outer_previous_cv = None
+    outer_consecutive_rises = 0
+    outer_best_cv = float("inf")
+    outer_best_result = None
 
     for iteration in range(iterations):
         metric_state = {"energy": 0.0, "cv": float("nan"), "cv_smoothed": float("nan"),
@@ -4104,6 +4127,14 @@ def optimize_center_trajectories_dual_blank_energy(
                     float("nan") if previous_ema is None
                     else abs(float(outer_ema) - float(previous_ema))
                 )
+                if outer_previous_cv is not None and outer_ema > outer_previous_cv:
+                    outer_consecutive_rises += 1
+                else:
+                    outer_consecutive_rises = 0
+                outer_previous_cv = float(outer_ema)
+                if outer_ema < outer_best_cv:
+                    outer_best_cv = float(outer_ema)
+                    outer_best_result = [s for s in upper_result]
             cv_smoothed = float(
                 outer_ema if outer_ema is not None else cv_value
             )
@@ -4140,6 +4171,8 @@ def optimize_center_trajectories_dual_blank_energy(
                     "uniform_delta": outer_ema_delta,
                     "uniform_threshold": cv_threshold,
                     "uniform_stable_count": float(outer_ema_stable_count),
+                    "uniform_consecutive_rises": float(outer_consecutive_rises),
+                    "uniform_metric_best": float(outer_best_cv),
                     "uniform_patience": float(outer_ema_patience),
                     "center_displacement_mean": motion_metric,
                     "center_displacement_max": motion_metric,
@@ -4155,6 +4188,13 @@ def optimize_center_trajectories_dual_blank_energy(
                 f"{outer_ema_stable_count} consecutive iterations.",
                 flush=True,
             )
+            break
+
+        if outer_consecutive_rises >= 10:
+            print(f"\n[Uniformity rising stop] EMA rose for 10 consecutive iterations; "
+                  f"rolling back to best EMA CV={outer_best_cv:.6e}.", flush=True)
+            if outer_best_result is not None:
+                upper_result = [s for s in outer_best_result]
             break
 
         # Once the outermost red samples are all within the target spacing of
@@ -5438,6 +5478,7 @@ class InteractiveVisualizer:
         self.current_metadata: dict[str, object] | None = None
         self.a_max = 1000.0  # 默认值
         self.j_max = 5000.0  # 默认值
+        self.arc_lock_guard_d = 2.0
         self.arc_speed_loss_pct = 0.0
         self.hide_model = False
         self.hide_traj = False
@@ -5795,28 +5836,28 @@ class TkControlPanel:
 
         tk.Label(self.root, text="最大加速度 (mm/s²): ", font=("Arial", 11)).grid(row=3, column=0, padx=10, pady=6,
                                                                                   sticky="w")
-        self.a_max_var = tk.StringVar(value="1000.0")  # 默认值，根据实际机器人设定
+        self.a_max_var = tk.StringVar(value=f"{self.visualizer.a_max:.12g}")
         self.a_max_entry = tk.Entry(self.root, textvariable=self.a_max_var, width=15, font=("Arial", 11))
         self.a_max_entry.grid(row=3, column=1, padx=10, pady=6, sticky="ew")
 
         # 【新增】：最大加加速度输入
         tk.Label(self.root, text="最大加加速度 (mm/s³): ", font=("Arial", 11)).grid(row=4, column=0, padx=10, pady=6,
                                                                                     sticky="w")
-        self.j_max_var = tk.StringVar(value="5000.0")  # 默认值
+        self.j_max_var = tk.StringVar(value=f"{self.visualizer.j_max:.12g}")
         self.j_max_entry = tk.Entry(self.root, textvariable=self.j_max_var, width=15, font=("Arial", 11))
         self.j_max_entry.grid(row=4, column=1, padx=10, pady=6, sticky="ew")
 
         tk.Label(self.root, text="Arc lock guard (total d): ", font=("Arial", 11)).grid(
             row=5, column=0, padx=10, pady=6, sticky="w"
         )
-        self.arc_lock_guard_var = tk.StringVar(value="2.0")
+        self.arc_lock_guard_var = tk.StringVar(value=f"{self.visualizer.arc_lock_guard_d:.12g}")
         self.arc_lock_guard_entry = tk.Entry(
             self.root, textvariable=self.arc_lock_guard_var, width=15, font=("Arial", 11)
         )
         self.arc_lock_guard_entry.grid(row=5, column=1, padx=10, pady=6, sticky="ew")
 
         tk.Label(self.root, text="圆弧速度损失 (%): ", font=("Arial", 11)).grid(row=6, column=0, padx=10, pady=6, sticky="w")
-        self.arc_speed_loss_var = tk.StringVar(value="0")
+        self.arc_speed_loss_var = tk.StringVar(value=f"{self.visualizer.arc_speed_loss_pct:.12g}")
         tk.Entry(self.root, textvariable=self.arc_speed_loss_var, width=15, font=("Arial", 11)).grid(row=6, column=1, padx=10, pady=6, sticky="ew")
 
         # 原有的按钮行号下移
@@ -5851,7 +5892,7 @@ class TkControlPanel:
         self.visualizer.hide_traj = self.hide_traj_var.get()
         self.visualizer.apply_visibility()
 
-    def _read_control_values(self) -> tuple[float, float, float] | None:
+    def _read_control_values(self) -> tuple[float, float, float, float, float, float, float] | None:
         try:
             spacing = float(self.spacing_var.get())
             if not np.isfinite(spacing) or spacing <= 0:
@@ -5862,15 +5903,29 @@ class TkControlPanel:
             spray_distance = float(self.spray_distance_var.get())
             if not np.isfinite(spray_distance):
                 raise ValueError
+            a_max = float(self.a_max_var.get())
+            j_max = float(self.j_max_var.get())
+            arc_lock_guard_d = float(self.arc_lock_guard_var.get())
+            arc_speed_loss_pct = float(self.arc_speed_loss_var.get())
+            if not np.isfinite(a_max) or a_max <= 0 or not np.isfinite(j_max) or j_max <= 0:
+                raise ValueError
+            if not np.isfinite(arc_lock_guard_d) or arc_lock_guard_d < 0:
+                raise ValueError
+            if not np.isfinite(arc_speed_loss_pct) or not 0 <= arc_speed_loss_pct <= 100:
+                raise ValueError
         except ValueError:
             messagebox.showerror("错误", "目标间距 d 和轨迹速度必须大于 0，喷涂距离必须是有效数字。")
             return None
-        return spacing, speed, spray_distance
+        return spacing, speed, spray_distance, a_max, j_max, arc_lock_guard_d, arc_speed_loss_pct
 
-    def _store_process_values(self, spacing: float, speed: float, spray_distance: float) -> None:
+    def _store_process_values(self, spacing, speed, spray_distance, a_max, j_max, arc_lock_guard_d, arc_speed_loss_pct) -> None:
         self.visualizer.current_spacing = spacing
         self.visualizer.trajectory_speed = speed
         self.visualizer.spray_distance = spray_distance
+        self.visualizer.a_max = a_max
+        self.visualizer.j_max = j_max
+        self.visualizer.arc_lock_guard_d = arc_lock_guard_d
+        self.visualizer.arc_speed_loss_pct = arc_speed_loss_pct
 
     def update_spacing(self):
         try:
@@ -5939,8 +5994,28 @@ class TkControlPanel:
         optimized = _remove_intersecting_boundary_tracks(optimized, tolerance=max(1.0, 0.05 * new_d))
         raw_trajectory = _remove_intersecting_boundary_tracks(raw_trajectory, tolerance=max(1.0, 0.05 * new_d))
 
+        if not messagebox.askyesno("能量优化", "是否重新启用能量优化？"):
+            self.visualizer.optimization_generation += 1
+            while True:
+                try:
+                    self.visualizer.optimization_events.get_nowait()
+                except queue.Empty:
+                    break
+            self.visualizer.reset_energy_history()
+            self.visualizer.optimization_reference = []
+            self.visualizer.current_trajectory = optimized
+            self.visualizer.update_trajectory(optimized, planning_frame, metadata, trajectory_2d=raw_trajectory)
+            self.visualizer.window.Render()
+            print(f"仅更新基础轨迹（未启用能量优化）: d={new_d:.6g}")
+            return
+
         # Relax the coupled straight portions first; quintic fitting is done
         # once from the completed relaxed geometry in the worker below.
+        while True:
+            try:
+                self.visualizer.optimization_events.get_nowait()
+            except queue.Empty:
+                break
         self.visualizer.reset_energy_history()
         self.visualizer.optimization_reference = list(optimized)
         self.visualizer.optimization_generation += 1
@@ -5985,22 +6060,8 @@ class TkControlPanel:
         values = self._read_control_values()
         if values is None:
             return
-        spacing, speed, spray_distance = values
-        self._store_process_values(spacing, speed, spray_distance)
-
-        # 读取界面输入的圆弧速度损失百分比
-        try:
-            arc_speed_loss_pct = float(self.arc_speed_loss_var.get())
-            if (
-                not np.isfinite(arc_speed_loss_pct)
-                or not 0 <= arc_speed_loss_pct <= 100
-            ):
-                raise ValueError
-        except ValueError:
-            messagebox.showerror(
-                "错误", "圆弧速度损失百分比必须是 0 到 100 之间的有效数字。"
-            )
-            return
+        spacing, speed, spray_distance, a_max, j_max, arc_lock_guard_d, arc_speed_loss_pct = values
+        self._store_process_values(spacing, speed, spray_distance, a_max, j_max, arc_lock_guard_d, arc_speed_loss_pct)
 
         if (
             not self.visualizer.current_trajectory
@@ -6059,6 +6120,10 @@ def _show_result(
         paq_path: Path,
         trajectory_speed: float,
         spray_distance: float,
+        a_max: float = 1000.0,
+        j_max: float = 5000.0,
+        arc_lock_guard_d: float = 2.0,
+        arc_speed_loss_pct: float = 0.0,
         trajectory_2d: Sequence[TrajectorySegment] | None = None,
 ) -> None:
     """Run the interactive visualizer and display live spline-boundary optimization."""
@@ -6066,6 +6131,10 @@ def _show_result(
         mesh, data, precut_seam, cut_edges, sample_step, initial_spacing,
         csv_path, metadata_path, paq_path, trajectory_speed, spray_distance
     )
+    visualizer.a_max = a_max
+    visualizer.j_max = j_max
+    visualizer.arc_lock_guard_d = arc_lock_guard_d
+    visualizer.arc_speed_loss_pct = arc_speed_loss_pct
     # 绘制传入的超椭圆拟合后轨迹
     visualizer.update_trajectory(trajectory, planning_frame, metadata, trajectory_2d=trajectory_2d)
     visualizer.reset_cameras()
@@ -6122,8 +6191,8 @@ def _show_result(
                 trajectory=optimized,
                 mesh=mesh,
                 speed=trajectory_speed,
-                a_max=1000.0,
-                j_max=5000.0,
+                a_max=a_max,
+                j_max=j_max,
                 sample_step=sample_step,
                 target_spacing=initial_spacing,
                 project_to_mesh=False,
@@ -6197,9 +6266,13 @@ def _request_spacing(
         seam: PrecutSeam,
         cut_edges: np.ndarray,
         initial_spacing: float,
+        initial_speed: float,
+        initial_spray_distance: float,
         initial_a_max: float,  # 【新增】
         initial_j_max: float,  # 【新增】
-) -> tuple[float | None, float, float]:  # 【修改返回值类型注解】
+        initial_arc_lock_guard_d: float,
+        initial_arc_speed_loss_pct: float,
+) -> tuple[float | None, float, float, float, float, float, float]:
     from vtktrajdisplay import request_spacing
     frame = _planning_frame(_resolve_main_seam_uv_segments(data, seam))
 
@@ -6207,14 +6280,17 @@ def _request_spacing(
     result = request_spacing(
         mesh, data.uv, data.uv_faces, initial_spacing,
         cut_edges=cut_edges, planning_frame=frame,
-        initial_a_max=initial_a_max, initial_j_max=initial_j_max,  # 【新增参数】
+        initial_speed=initial_speed, initial_spray_distance=initial_spray_distance,
+        initial_a_max=initial_a_max, initial_j_max=initial_j_max,
+        initial_arc_lock_guard_d=initial_arc_lock_guard_d,
+        initial_arc_speed_loss_pct=initial_arc_speed_loss_pct,
     )
 
     if result is None:
-        return None, None, None
+        return (None,) * 7
 
-    spacing, a_max, j_max = result
-    return spacing, a_max, j_max
+    return (result["d"], result["speed"], result["spray_distance"], result["a_max"],
+            result["j_max"], result["arc_lock_guard_d"], result["arc_speed_loss_pct"])
 
 
 def _play_iteration_animation(mesh: trimesh.Trimesh, result_obj: Path) -> None:
@@ -6299,13 +6375,23 @@ def main() -> None:
         cut_edges = optimized_cut_edges
     if args.no_show:
         selected_spacing = args.spacing
+        selected_speed = args.trajectory_speed
+        selected_spray_distance = args.spray_distance
         selected_a_max = args.a_max
         selected_j_max = args.j_max
+        selected_arc_lock_guard_d = args.arc_lock_guard_d
+        selected_arc_speed_loss_pct = 0.0
     else:
-        selected_spacing, selected_a_max, selected_j_max = _request_spacing(
+        (selected_spacing, selected_speed, selected_spray_distance, selected_a_max,
+         selected_j_max, selected_arc_lock_guard_d,
+         selected_arc_speed_loss_pct) = _request_spacing(
             mesh, data, precut_seam, cut_edges, args.spacing,
+            initial_speed=args.trajectory_speed,
+            initial_spray_distance=args.spray_distance,
             initial_a_max=args.a_max,
             initial_j_max=args.j_max,
+            initial_arc_lock_guard_d=args.arc_lock_guard_d,
+            initial_arc_speed_loss_pct=0.0,
         )
 
     if selected_spacing is None:
@@ -6320,13 +6406,13 @@ def main() -> None:
     arc_trajectory = optimize_trajectory_arcs_postprocess(
         trajectory=raw_trajectory,
         mesh=mesh,
-        speed=args.trajectory_speed,
+        speed=selected_speed,
         a_max=selected_a_max,
         j_max=selected_j_max,
         target_spacing=selected_spacing,
         sample_step=sample_step_val,
         center_boundary_limit=(args.arc_center_limit if args.arc_center_limit > 0.0 else None),
-        arc_lock_guard_d=args.arc_lock_guard_d,
+        arc_lock_guard_d=selected_arc_lock_guard_d,
     )
 
     # 对优化后的每条喷涂轨迹做曲率自适应五次最小二乘拟合；过渡段保持原样。
@@ -6364,13 +6450,16 @@ def main() -> None:
         selected_path.stem + "_optcuts_trajectory_PAQ.txt"
     )
 
-    _export_paq_trajectory(paq_path, mesh, final_trajectory,
-                           args.trajectory_speed, args.spray_distance)
     matrix_path = paq_path.with_name(paq_path.stem + "_matrix.txt")
-    _export_matrix_trajectory(
-        matrix_path, mesh, final_trajectory,
-        args.trajectory_speed, args.spray_distance,
-    )
+
+    if args.no_show:
+        _export_paq_trajectory(paq_path, mesh, final_trajectory,
+                               selected_speed, selected_spray_distance,
+                               arc_speed_loss_pct=selected_arc_speed_loss_pct)
+        _export_matrix_trajectory(
+            matrix_path, mesh, final_trajectory,
+            selected_speed, selected_spray_distance,
+        )
 
     print(f"Pre-cut shortest-boundary seam edges: {len(precut_seam.edges)}")
     print(f"Additional detected OptCuts seam edges: {len(optimized_cut_edges)}")
@@ -6380,7 +6469,9 @@ def main() -> None:
         _show_result(
             mesh, data, precut_seam, cut_edges, final_trajectory, planning_frame, metadata,
             selected_spacing, sample_step_val, csv_path, metadata_path,
-            paq_path, args.trajectory_speed, args.spray_distance,
+            paq_path, selected_speed, selected_spray_distance,
+            selected_a_max, selected_j_max, selected_arc_lock_guard_d,
+            selected_arc_speed_loss_pct,
             trajectory_2d=raw_trajectory,
         )
     if not args.no_animation:

@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+#723的备份，原始轨迹
+from scipy.spatial import cKDTree
 import argparse
 import csv
 import json
@@ -12,22 +13,18 @@ import tkinter as tk
 from tkinter import messagebox
 from dataclasses import dataclass
 from pathlib import Path
-import cutopt_cache
 from typing import Iterable, List, Optional, Sequence, Tuple
 import heapq
 import numpy as np
 import trimesh
 import vtk
-from scipy.spatial import cKDTree
-from scipy.optimize import minimize, root_scalar
-from scipy.interpolate import splprep, splev  # 【必须补上这句】
-#超椭圆拟合（还未进入圆弧）
+
 ROOT = Path(__file__).resolve().parents[2]
 OPTCUTS_ROOT = ROOT / "third_party" / "OptCuts"
 OPTCUTS_EXE = OPTCUTS_ROOT / "build" / "Release" / "OptCuts_bin.exe"
 FINAL_FRAME_HOLD_MS = 2000
 DEFAULT_TRAJECTORY_SPACING = 30.0
-DEFAULT_TRAJECTORY_SPEED = 300.0
+DEFAULT_TRAJECTORY_SPEED = 50.0
 DEFAULT_SPRAY_DISTANCE = 0.0
 EPS = 1.0e-9
 
@@ -72,14 +69,13 @@ class SeamUVSegment:
 @dataclass
 class TrajectorySegment:
     """One explicit path event; UV is absent for off-surface 3D motion."""
+
     kind: str
     uv: np.ndarray
     xyz: np.ndarray
     spray_on: bool
     note: str = ""
-    region: str = ""
-    phases: Optional[np.ndarray] = None
-    geometry_meta: Optional[dict] = None  # 【新增】：持久化保存解析几何公式与方程参数
+    region: str = ""  # 【新增】：所属工艺区域 ("LOWER", "CENTER", "UPPER", "TRANSITION")
 
 
 @dataclass(frozen=True)
@@ -693,9 +689,8 @@ def _select_mesh_file() -> str:
     root.withdraw()
     root.update()
     path = filedialog.askopenfilename(
-        title="Select mesh or OptCuts cache",
+        title="Select mesh for OptCuts",
         filetypes=[
-            ("OptCuts cache", "*.json"),
             ("Mesh files", "*.stl *.obj *.ply *.off"),
             ("OBJ files", "*.obj"),
             ("STL files", "*.stl"),
@@ -778,6 +773,7 @@ def trace_straight_seam(
 
     path = dijkstra_path(adj, start_idx, end_idx, vertices)
     return path
+
 
 def _precut_two_boundaries(
     mesh: trimesh.Trimesh,
@@ -1321,6 +1317,71 @@ def _region_interval(
     return min(item[0] for item in candidates), max(item[1] for item in candidates)
 
 
+def generate_pca_uv_trajectory(
+        data: ObjUVData, spacing: float, sample_step: float | None = None,
+) -> list[TrajectorySegment]:
+    """Generate parallel UV scans along PCA axes and map them to 3-D."""
+    uv = np.asarray(data.uv, dtype=float)
+    faces = np.asarray(data.uv_faces, dtype=np.int64)
+    if len(uv) < 3 or len(faces) == 0:
+        raise ValueError("OptCuts UV data is too small for PCA trajectory generation.")
+    spacing = float(spacing)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError("Trajectory spacing must be greater than zero.")
+    center = uv.mean(axis=0)
+    _, _, vh = np.linalg.svd(uv - center, full_matrices=False)
+    axis_u, axis_v = vh[0], vh[1]
+    if axis_u[np.argmax(np.abs(axis_u))] < 0.0:
+        axis_u = -axis_u
+    if np.cross(axis_u, axis_v) < 0.0:
+        axis_v = -axis_v
+    # PC2 is the scan direction; PC1 is the direction in which tracks are offset.
+    local = np.column_stack(((uv - center) @ axis_u, (uv - center) @ axis_v))
+    u_min, u_max = float(local[:, 0].min()), float(local[:, 0].max())
+    step = spacing if sample_step is None else max(float(sample_step), spacing / 10.0)
+    mapper = _UVToXYZMapper(data)
+    segments: list[TrajectorySegment] = []
+    line_count = max(1, int(np.floor((u_max - u_min) / spacing)) + 1)
+    for line_index in range(line_count + 1):
+        u_value = u_min + line_index * spacing
+        if u_value > u_max + 1.0e-9:
+            break
+        intervals: list[tuple[float, float]] = []
+        for face in faces:
+            tri = local[face]
+            xs = []
+            for i in range(3):
+                a, b = tri[i], tri[(i + 1) % 3]
+                da, db = a[0] - u_value, b[0] - u_value
+                if abs(da) <= 1.0e-10:
+                    xs.append(float(a[1]))
+                if da * db < -1.0e-20:
+                    ratio = da / (da - db)
+                    xs.append(float(a[1] + ratio * (b[1] - a[1])))
+            if len(xs) >= 2:
+                intervals.append((min(xs), max(xs)))
+        if not intervals:
+            continue
+        intervals.sort()
+        merged: list[list[float]] = []
+        for left, right in intervals:
+            if merged and left <= merged[-1][1] + 1.0e-8:
+                merged[-1][1] = max(merged[-1][1], right)
+            else:
+                merged.append([left, right])
+        for left, right in merged:
+            length = right - left
+            count = max(2, int(np.ceil(length / step)) + 1)
+            x_values = np.linspace(left, right, count)
+            uv_line = center + np.outer(np.full(count, u_value), axis_u) + np.outer(x_values, axis_v)
+            xyz_line = mapper.map(uv_line, bridge_outside=False)
+            if np.isfinite(xyz_line).all():
+                segments.append(TrajectorySegment("SURFACE_SCAN", uv_line, xyz_line, True, "PCA UV scan", "PCA"))
+    if not segments:
+        raise ValueError("PCA axes produced no scan segments inside the UV domain.")
+    return segments
+
+
 def optimize_spacing(nominal: float, dimensions: np.ndarray) -> Optimum:
     nominal = float(nominal)
     if nominal <= 0.0:
@@ -1749,18 +1810,13 @@ def _make_surface_scan(
         mapper: _UVToXYZMapper,
         snap_tolerance: float | None = None,
         note: str = "",
-        region: str = "",
+        region: str = "",  # 【新增参数】
 ) -> TrajectorySegment:
     uv = _sample_scan_uv(x_value, interval, upward, sample_step, frame)
-    xyz = mapper.map(uv, snap_tolerance, bridge_outside=True)
-
-    # 【新增】：生成 0/1 阶段数组（前半部分为 0，后半部分为 1）
-    n_pts = len(xyz)
-    phases = np.where(np.arange(n_pts) < n_pts // 2, 0, 1)
-
     return TrajectorySegment(
-        "SURFACE_SCAN", uv, xyz, True, note, region,
-        phases=phases  # 传入 phases
+        "SURFACE_SCAN", uv,
+        mapper.map(uv, snap_tolerance, bridge_outside=True), True, note,
+        region  # 【传入 region】
     )
 
 
@@ -1883,1107 +1939,94 @@ def smooth_v_trajectory(
     return smoothed_xyz
 
 
-def extract_raw_v_trajectories(
-        trajectory: List[TrajectorySegment],
-) -> List[dict]:
-    """
-    第一阶段：提取 LOWER/UPPER 区域的原始 V 形轨迹特征及关键控制点。
-    严格保证 P1(起点)、P3(终点) 作为固定端点，P2 为原始几何尖点。
-    """
-    v_segments = []
-    for seg in trajectory:
-        if seg.kind == "SURFACE_SCAN" and getattr(seg, "region", "") in ("LOWER", "UPPER"):
-            xyz = np.asarray(seg.xyz, dtype=float)
-            if len(xyz) < 3:
-                v_segments.append({"type": "PASSTHROUGH", "seg": seg})
-                continue
-
-            P1 = xyz[0]
-            P3 = xyz[-1]
-            chord_vec = P3 - P1
-            chord_len = np.linalg.norm(chord_vec)
-            if chord_len < 1e-6:
-                v_segments.append({"type": "PASSTHROUGH", "seg": seg})
-                continue
-
-            u_chord = chord_vec / chord_len
-            vecs = xyz - P1
-            proj_lengths = vecs @ u_chord
-            proj_pts = P1 + np.outer(proj_lengths, u_chord)
-            perp_dists = np.linalg.norm(xyz - proj_pts, axis=1)
-            idx_tip = int(np.argmax(perp_dists))
-            P2 = xyz[idx_tip]
-
-            v_segments.append({
-                "type": "V_SHAPE",
-                "seg": seg,
-                "xyz": xyz,
-                "idx_tip": idx_tip,
-                "P1": P1,
-                "P2": P2,
-                "P3": P3,
-            })
-        else:
-            v_segments.append({"type": "PASSTHROUGH", "seg": seg})
-    return v_segments
-
-
-def fit_superellipse_v_trajectories(
-        extracted_v_data: List[dict],
-        mesh: trimesh.Trimesh,
-        speed: float,
-        a_max: float,
-        j_max: float,
-        target_spacing: float = 30.0,
-        sample_step: float = 1.0,
-) -> List[TrajectorySegment]:
-    """
-    全自由度高保真超椭圆拟合器：
-    - 端点 P1, P3 严格绝对锁定；
-    - 联合优化 [形态指数 n, 顶点高度 b, 轴向倾角 theta]，实现对原始轨迹的最大逼近保真度；
-    - 采用点云几何正交投影距离作为损失函数，避免索引错位导致的轨迹凹瘪畸变。
-    """
-    effective_step = sample_step if sample_step > 1e-6 else 1.0
-    fitted_segments: List[TrajectorySegment] = []
-
-    for item in extracted_v_data:
-        if item["type"] == "PASSTHROUGH":
-            fitted_segments.append(item["seg"])
-            continue
-
-        seg = item["seg"]
-        xyz_raw = np.asarray(item["xyz"], dtype=float)
-        P1 = item["P1"]
-        P3 = item["P3"]
-        P2 = item["P2"]
-
-        if len(xyz_raw) < 5:
-            fitted_segments.append(seg)
-            continue
-
-        # ---------------------------------------------------------------------
-        # 1. 建立 3D 几何参考基底 (端点 P1, P3 严格锁定)
-        # ---------------------------------------------------------------------
-        M = 0.5 * (P1 + P3)
-        X_axis = P3 - P1
-        span_2a = np.linalg.norm(X_axis)
-        if span_2a < 1e-6:
-            fitted_segments.append(seg)
-            continue
-        X_dir = X_axis / span_2a
-        a = span_2a / 2.0
-
-        # 初始高度矢量
-        height_vec = P2 - M
-        h_comp = height_vec - np.dot(height_vec, X_dir) * X_dir
-        b_init = float(np.linalg.norm(h_comp))
-        if b_init < 1e-6:
-            fitted_segments.append(seg)
-            continue
-        Y_dir_base = h_comp / b_init
-        Z_dir = np.cross(X_dir, Y_dir_base)
-        Z_norm = np.linalg.norm(Z_dir)
-        if Z_norm > 1e-6:
-            Z_dir /= Z_norm
-        else:
-            Z_dir = np.array([0.0, 0.0, 1.0])
-
-        # ---------------------------------------------------------------------
-        # 2. 参数化超椭圆生成器：支持 n、高度 b、空间倾角 theta
-        # ---------------------------------------------------------------------
-        def eval_superellipse_3d(n_val, b_val, theta_val, num_pts=100):
-            t = np.linspace(math.pi, 0.0, num_pts)
-            cos_t = np.cos(t)
-            sin_t = np.sin(t)
-            exp_p = 2.0 / max(n_val, 0.05)
-
-            x_loc = a * np.sign(cos_t) * (np.abs(cos_t) ** exp_p)
-            y_loc = b_val * (np.abs(sin_t) ** exp_p)
-
-            # 沿法向方向允许微小旋转倾斜 theta
-            Y_dir_t = Y_dir_base * np.cos(theta_val) + Z_dir * np.sin(theta_val)
-            curve_pts = M[None, :] + np.outer(x_loc, X_dir) + np.outer(y_loc, Y_dir_t)
-            return curve_pts
-
-        # ---------------------------------------------------------------------
-        # 3. 高保真优化目标：最小化“原始点阵”与“生成超椭圆”之间的正交几何投影误差
-        # ---------------------------------------------------------------------
-        tree_raw = cKDTree(xyz_raw)
-
-        def objective_loss(params):
-            n_curr, b_curr, theta_curr = params
-            # 生成稠密测试样条
-            test_curve = eval_superellipse_3d(n_curr, b_curr, theta_curr, num_pts=80)
-
-            # 双向几何距离均方差：
-            # 1. 拟合线上的点到原始点的距离
-            dists_c2r, _ = tree_raw.query(test_curve)
-            # 2. 原始点到拟合线上的距离
-            tree_test = cKDTree(test_curve)
-            dists_r2c, _ = tree_test.query(xyz_raw)
-
-            loss = np.mean(dists_c2r ** 2) + np.mean(dists_r2c ** 2)
-            return loss
-
-        # 自由度全开的搜索边界：
-        # n: [0.1, 2.5] (全面涵盖内摆线、直边三角、勒洛三角、圆弧/椭圆)
-        # b: [0.5 * b_init, 1.3 * b_init] (给高度充分自由度，不锁死)
-        # theta: [-15°, +15°] (适应曲面法向微小扭转)
-        bounds = [
-            (0.10, 2.50),
-            (0.50 * b_init, 1.30 * b_init),
-            (-np.radians(15.0), np.radians(15.0))
-        ]
-
-        # 多初始点探索以防局部极小
-        best_res = None
-        best_loss = float("inf")
-        for n_try in [0.5, 1.0, 1.5, 2.0]:
-            init_x = [n_try, b_init, 0.0]
-            res = minimize(objective_loss, init_x, bounds=bounds, method='L-BFGS-B')
-            if res.fun < best_loss:
-                best_loss = res.fun
-                best_res = res
-
-        best_n, best_b, best_theta = best_res.x
-
-        # ---------------------------------------------------------------------
-        # 4. 生成最终高密度连续 3D 超椭圆，并贴附 STL 网格曲面
-        # ---------------------------------------------------------------------
-        # 根据弧长动态决定等距点数
-        arc_est = math.pi * math.sqrt(0.5 * (a ** 2 + best_b ** 2))
-        num_final = max(32, int(np.ceil(arc_est / effective_step)) + 1)
-
-        final_curve = eval_superellipse_3d(best_n, best_b, best_theta, num_pts=num_final)
-
-        # 刚性锁定首尾端点 (P1, P3 绝不移动)
-        final_curve[0] = P1
-        final_curve[-1] = P3
-
-        # 投影吸附回 STL 三角网格表面
-        proj_curve, _, _ = trimesh.proximity.closest_point(mesh, final_curve)
-        proj_curve[0] = P1
-        proj_curve[-1] = P3
-
-        # 判定拟合形态
-        if best_n < 0.85:
-            shape_type = "三角内摆线"
-        elif best_n <= 1.15:
-            shape_type = "标准三角"
-        elif best_n < 1.95:
-            shape_type = "勒洛三角"
-        else:
-            shape_type = "标准椭圆"
-
-        n_pts = len(proj_curve)
-        phases = np.where(np.arange(n_pts) < n_pts // 2, 0, 1)
-
-        geometry_meta = {
-            "type": "SUPERELLIPSE",
-            "a": float(a),
-            "b": float(best_b),
-            "n": float(best_n),
-            "theta_deg": float(np.degrees(best_theta)),
-            "P1": P1.tolist(),
-            "P3": P3.tolist(),
-        }
-
-        fitted_segments.append(TrajectorySegment(
-            kind=seg.kind,
-            uv=np.full((n_pts, 2), np.nan),
-            xyz=proj_curve,
-            spray_on=seg.spray_on,
-            note=seg.note.split(" [")[0] + f" [{shape_type} n={best_n:.2f}, b={best_b:.1f}]",
-            region=seg.region,
-            phases=phases,
-            geometry_meta=geometry_meta
-        ))
-
-    return fitted_segments
-
-
-def prune_v_sharp_apex(
-        xyz: np.ndarray,
-        cutoff_distance: float,
-        mesh: trimesh.Trimesh | None = None
-) -> np.ndarray:
-    """
-    鲁棒的 V 字折返截断：通过弦向距离精确找到折返尖点 P2，再向两臂回溯截断。
-    """
-    if len(xyz) < 8:
-        return xyz
-
-    # 1. 严格通过离首尾弦线最远的点找到几何折返尖点 P2
-    P1, P3 = xyz[0], xyz[-1]
-    chord = P3 - P1
-    chord_len = np.linalg.norm(chord)
-    if chord_len < 1e-6:
-        return xyz
-    u_chord = chord / chord_len
-    vecs = xyz - P1
-    perp_dists = np.linalg.norm(vecs - np.outer(vecs @ u_chord, u_chord), axis=1)
-    tip_idx = int(np.argmax(perp_dists))
-
-    if tip_idx <= 2 or tip_idx >= len(xyz) - 3:
-        return xyz
-
-    # 2. 拆分为进气臂与出气臂
-    leg1 = xyz[:tip_idx + 1]  # 0 -> tip
-    leg2 = xyz[tip_idx:]      # tip -> end
-
-    # 3. 计算两臂欧氏距离矩阵
-    diffs = np.linalg.norm(leg1[:, None, :] - leg2[None, :, :], axis=2)
-    under_cutoff = diffs < cutoff_distance
-
-    if not np.any(under_cutoff):
-        return xyz
-
-    i_indices, j_indices = np.where(under_cutoff)
-    idx1 = max(0, int(np.min(i_indices)) - 1)
-    idx2 = min(len(leg2) - 1, int(np.max(j_indices)) + 1)
-
-    if idx1 >= len(leg1) or idx2 <= 0:
-        return xyz
-
-    # 4. 截断两臂并在截断中点插入平滑新顶点
-    p1 = leg1[idx1]
-    p2 = leg2[idx2]
-    p_mid = 0.5 * (p1 + p2)
-
-    new_xyz = np.vstack([
-        leg1[:idx1 + 1],
-        p_mid[None, :],
-        leg2[idx2:]
-    ])
-
-    if mesh is not None:
-        proj_mid, _, _ = trimesh.proximity.closest_point(mesh, p_mid[None, :])
-        new_xyz[idx1 + 1] = proj_mid[0]
-
-    return new_xyz
-
-
 def optimize_trajectory_arcs_postprocess(
-        trajectory: List[TrajectorySegment],
-        mesh: trimesh.Trimesh,
-        speed: float = 300.0,
-        a_max: float = 1000.0,
-        j_max: float = 5000.0,
-        target_spacing: float = 30.0,
-        sample_step: float = 1.0,
-        **kwargs
+    trajectory: List[TrajectorySegment],
+    mesh: trimesh.Trimesh,
+    sample_step: float = 1.0,
+    smooth_iterations: int = 2,
+    smooth_weight: float = 0.25,
 ) -> List[TrajectorySegment]:
     """
-    统一入口：
-    第一步：调用 prune_v_sharp_apex 彻底截断两臂间距 < d/2 的死区
-    第二步：调用 extract_raw_v_trajectories 提取截断后的真实特征点
-    第三步：调用 fit_superellipse_v_trajectories 执行全自由度超椭圆拟合
+    纯 3D 空间轨迹后处理优化器（不再返回 UV 空间）：
+    1. 取初代轨迹边界起点 P1、终点 P3，弦长 d，半径 R = d/2。
+    2. 用距离弦线最远的峰值点 P2 确定半圆拱起方向（鲁棒，无需硬编码区域方向）。
+    3. 在 3D 空间 (P1,P3,P2) 平面内生成半圆弧。
+    4. 投影到 STL 曲面 -> 拉普拉斯平滑去锯齿 -> 二次投影回曲面 -> 钉死首尾。
+    5. CENTER 区域与 OVERTRAVEL 等过渡段保持原样。
     """
-    pruned_trajectory: List[TrajectorySegment] = []
-    cutoff_d = 2.0 * float(target_spacing)  # d/2 截断阈值
+    optimized: List[TrajectorySegment] = []
 
-    # 1. 执行物理截断
-    for seg in trajectory:
-        if seg.kind == "SURFACE_SCAN" and getattr(seg, "region", "") in ("LOWER", "UPPER"):
-            xyz = np.asarray(seg.xyz, dtype=float)
-            if len(xyz) >= 8:
-                xyz_pruned = prune_v_sharp_apex(xyz, cutoff_distance=cutoff_d, mesh=mesh)
-                n_p = len(xyz_pruned)
-                phases_p = np.where(np.arange(n_p) < n_p // 2, 0, 1)
-
-                pruned_trajectory.append(TrajectorySegment(
-                    kind=seg.kind,
-                    uv=seg.uv,
-                    xyz=xyz_pruned,
-                    spray_on=seg.spray_on,
-                    note=seg.note,
-                    region=seg.region,
-                    phases=phases_p,
-                    geometry_meta=seg.geometry_meta
-                ))
-            else:
-                pruned_trajectory.append(seg)
-        else:
-            pruned_trajectory.append(seg)
-
-    # 2. 提取截断后的特征控制点
-    v_data = extract_raw_v_trajectories(pruned_trajectory)
-
-    # 3. 真正执行高保真超椭圆拟合
-    fitted_trajectory = fit_superellipse_v_trajectories(
-        v_data,
-        mesh=mesh,
-        speed=speed,
-        a_max=a_max,
-        j_max=j_max,
-        target_spacing=target_spacing,
-        sample_step=sample_step,
-    )
-    return fitted_trajectory
-
-#            CENTER 区域 双空白能量场优化器（最终版，纯 3D，不依赖 UV）
-# =========================================================================
-
-def _resample_polyline(pts: np.ndarray, step: float) -> np.ndarray:
-    """按弧长均匀重采样折线（钉死首尾端点）。"""
-    pts = np.asarray(pts, dtype=float)
-    if len(pts) < 2 or step <= 1e-9:
-        return pts
-    seg_len = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-    cum = np.r_[0.0, np.cumsum(seg_len)]
-    total = float(cum[-1])
-    if total <= 1e-9:
-        return pts
-    n = max(2, int(round(total / step)) + 1)
-    s = np.linspace(0.0, total, n)
-    out = np.empty((n, 3), dtype=float)
-    for k in range(3):
-        out[:, k] = np.interp(s, cum, pts[:, k])
-    out[0], out[-1] = pts[0], pts[-1]
-    return out
-
-
-def _void_centers(
-        tri_centers: np.ndarray,
-        fixed_pts: np.ndarray,
-        center_pts: np.ndarray,
-        d: float,
-        n_centers: int = 2,
-) -> tuple:
-    """自动定位 mesh 上最大的 n_centers 个空白区中心。
-    与部件朝向、圆弧区域存在几个均无关。
-    返回 (centers, max_void_depth)；max_void_depth 用于判断是否存在大空白（缺弧）。"""
-    from scipy.spatial import cKDTree
-    all_pts = np.vstack([fixed_pts, center_pts]) if len(fixed_pts) else center_pts
-    dist, _ = cKDTree(all_pts).query(tri_centers)
-
-    void_mask = dist > 0.6 * d
-    void_pts = tri_centers[void_mask]
-    void_w = dist[void_mask] - 0.6 * d
-    if len(void_pts) == 0:
-        return [], 0.0  # 【鲁棒性3】：无空白 -> 空列表 + 深度 0
-    max_void_depth = float(void_w.max())
-
-    order = np.argsort(void_w)[::-1]
-    seeds = []
-    for idx in order:
-        c = void_pts[idx]
-        if all(float(np.linalg.norm(c - s)) > 3.0 * d for s in seeds):
-            seeds.append(c)
-        if len(seeds) == n_centers:
-            break
-
-    centers = []
-    for s in seeds:
-        local = np.linalg.norm(void_pts - s, axis=1) <= 1.5 * d
-        if np.any(local):
-            w = np.maximum(void_w[local], 1e-6)
-            centers.append((void_pts[local] * w[:, None]).sum(axis=0) / w.sum())
-        else:
-            centers.append(s)
-    return centers, max_void_depth
-
-
-def _trajectory_objective(
-        tri_centers: np.ndarray,
-        fixed_pts: np.ndarray,
-        lines: Sequence[np.ndarray],
-        target_spacing: float,
-        coverage_weight: float,
-        spacing_weight: float,
-        boundary_weight: float,
-        smooth_weight: float,
-) -> tuple[float, dict[str, float]]:
-    """Evaluate one fixed, dimensionless trajectory-quality objective.
-
-    Every component is a mean squared loss, so changing the resampling point
-    count does not by itself change the reported energy.
-    """
-    d = max(float(target_spacing), EPS)
-    center_pts = np.vstack(lines)
-    all_scan_pts = (
-        np.vstack([fixed_pts, center_pts]) if len(fixed_pts) else center_pts
-    )
-
-    # Mesh samples farther than half the desired track spacing are uncovered.
-    coverage_distance, _ = cKDTree(all_scan_pts).query(tri_centers)
-    coverage_residual = np.maximum(coverage_distance / d - 0.5, 0.0)
-    coverage_loss = float(np.mean(coverage_residual ** 2))
-
-    # Adjacent center trajectories should remain one target spacing apart.
-    spacing_samples: list[np.ndarray] = []
-    for first, second in zip(lines[:-1], lines[1:]):
-        first_to_second, _ = cKDTree(second).query(first)
-        second_to_first, _ = cKDTree(first).query(second)
-        spacing_samples.extend([first_to_second, second_to_first])
-    if spacing_samples:
-        spacing_distance = np.concatenate(spacing_samples)
-        spacing_loss = float(np.mean((spacing_distance / d - 1.0) ** 2))
-    else:
-        spacing_loss = 0.0
-
-    # CENTER paths must not enter the protected LOWER/UPPER arc zone.
-    if len(fixed_pts):
-        boundary_distance, _ = cKDTree(fixed_pts).query(center_pts)
-        boundary_residual = np.maximum(1.15 - boundary_distance / d, 0.0)
-        boundary_loss = float(np.mean(boundary_residual ** 2))
-    else:
-        boundary_loss = 0.0
-
-    # Penalize discrete curvature; normalize by d to make it dimensionless.
-    curvature_samples = [
-        np.linalg.norm(line[:-2] - 2.0 * line[1:-1] + line[2:], axis=1) / d
-        for line in lines if len(line) > 2
-    ]
-    smooth_loss = (
-        float(np.mean(np.concatenate(curvature_samples) ** 2))
-        if curvature_samples else 0.0
-    )
-
-    components = {
-        "coverage": coverage_loss,
-        "spacing": spacing_loss,
-        "boundary": boundary_loss,
-        "smooth": smooth_loss,
-    }
-    total = (
-            coverage_weight * coverage_loss
-            + spacing_weight * spacing_loss
-            + boundary_weight * boundary_loss
-            + smooth_weight * smooth_loss
-    )
-    return float(total), components
-
-
-def _extract_arc_geometries(trajectory: List[TrajectorySegment]) -> list[dict]:
-    """提取 LOWER/UPPER 区域圆弧的 2D 投影平面几何信息 (M, u, v, radius)"""
-    arcs = []
     for seg in trajectory:
         if seg.kind == "SURFACE_SCAN" and getattr(seg, "region", "") in ("LOWER", "UPPER"):
             xyz = np.asarray(seg.xyz, dtype=float)
             if len(xyz) < 3:
+                optimized.append(seg)
                 continue
-            p1, p3 = xyz[0], xyz[-1]
-            chord = p3 - p1
-            chord_len = float(np.linalg.norm(chord))
-            if chord_len < 1e-6:
-                continue
-            u = chord / chord_len
-            m = 0.5 * (p1 + p3)
 
-            # 寻找拱起峰值点 P2，确定正交方向 v (指向圆弧凸起方向)
+            p1 = xyz[0]                      # 边界起点 P1
+            p3 = xyz[-1]                     # 边界终点 P3
+            chord = p3 - p1
+            d = float(np.linalg.norm(chord))
+            if d < 1e-6:
+                optimized.append(seg)
+                continue
+            u = chord / d                    # 弦方向
+
+            # 寻找峰值点 P2：距离弦线最远的点，用于确定拱起方向
             vecs = xyz - p1
             perps = vecs - np.outer(vecs @ u, u)
             p2 = xyz[int(np.argmax(np.linalg.norm(perps, axis=1)))]
 
+            # 3D 半圆平面基向量：v 为 P2 相对弦中点的正交分量
+            m = 0.5 * (p1 + p3)
             w = p2 - m
             v = w - np.dot(w, u) * u
-            v_norm = float(np.linalg.norm(v))
-            if v_norm < 1e-6:
+            vn = float(np.linalg.norm(v))
+            if vn < 1e-6:                    # P1,P2,P3 共线，无法成弧
+                optimized.append(seg)
                 continue
-            v /= v_norm
-            radius = chord_len / 2.0
+            v /= vn
 
-            arcs.append({
-                "midpoint": m,
-                "u": u,
-                "v": v,
-                "radius": radius,
-                "region": getattr(seg, "region", "")
-            })
-    return arcs
+            # 在 3D 空间生成半圆弧：theta=0 -> P1, theta=pi -> P3, 凸向 P2
+            R = d / 2.0
+            count = max(16, int(np.ceil(np.pi * R / sample_step)) + 1)
+            theta = np.linspace(0.0, np.pi, count)
+            arc = (m[None, :]
+                   - R * np.cos(theta)[:, None] * u[None, :]
+                   + R * np.sin(theta)[:, None] * v[None, :])
 
+            # ① 投影到 STL 曲面
+            proj, _, _ = trimesh.proximity.closest_point(mesh, arc)
+            proj[0] = p1
+            proj[-1] = p3
 
-def optimize_center_trajectories_dual_blank_energy(
-        trajectory: List[TrajectorySegment],
-        mesh: trimesh.Trimesh,
-        iterations: int = 140,
-        attract_weight: float = 0.35,  # 空白区引导引力
-        self_repel_weight: float = 0.30,  # 线上节点互斥力
-        arc_repel_weight: float = 3.50,  # 归一化微阶梯外推权重
-        elastic_weight: float = 0.10,  # 顺向平滑刚度
-        transverse_weight: float = 0.60,  # 跨线 Δ 变动均摊刚度
-        target_spacing: float = 30.0,
-        sample_step: float | None = None,
-        influence_radius: float | None = None,
-        recompute_blank_every: int = 6,
-        resample_every: int = 3,
-        anneal: float = 0.96,
+            # ② 拉普拉斯平滑，消除三角网格投影锯齿（首尾点保持不变）
+            smoothed = smooth_v_trajectory(
+                proj,
+                min_distance=1e-4,
+                smooth_iterations=smooth_iterations,
+                smooth_weight=smooth_weight,
+            )
 
-        # =========================
-        # 新增：基于喷涂均匀性的早停
-        # =========================
-        uniform_stop: bool = True,
-        uniform_metric: str = "cv",  # "cv" / "std" / "var"
-        uniform_radius: float | None = None,  # 默认使用 target_spacing d
-        uniform_every: int = 3,  # 每几轮计算一次均匀性
-        uniform_min_iterations: int = 24,  # 至少迭代 24 轮后才允许早停
-        uniform_patience: int = 4,  # 连续 4 次评估变化很小就停止
-        uniform_rel_tol: float = 6.18e-4,  # 宽松：允许约 0.5% 的相对变化
-        uniform_abs_tol: float = 1e-6,  # 宽松：绝对变化阈值
-        uniform_window: int = 10,  # 最近 6 次评估用于检测往返波动
-        uniform_oscillation_tol: float = 1.5e-3,  # 宽松：窗口波动范围允许约 3%
-        uniform_active_eps: float = 1e-12,  # 认为有效贡献的下限
-        uniform_use_area_weights: bool = True,  # 用顶点面积加权，避免顶点密度影响
-        uniform_include_fixed: bool = True,  # 是否把 LOWER/UPPER 固定轨迹也算入喷涂贡献
-        return_best_uniform: bool = True,  # 早停后返回历史最优轨迹，而不是最后一轮
+            # ③ 平滑会把点拉离曲面，二次投影贴回曲面，并再次钉死首尾
+            final_xyz, _, _ = trimesh.proximity.closest_point(mesh, smoothed)
+            final_xyz[0] = p1
+            final_xyz[-1] = p3
 
-        on_iteration=None,
-) -> List[TrajectorySegment]:
-    from scipy.spatial import cKDTree
-
-    d = float(target_spacing)
-    step0 = d / 4.0 if sample_step is None else float(sample_step)
-    if not np.isfinite(d) or d <= 0.0:
-        raise ValueError("target_spacing must be finite and greater than zero.")
-    if not np.isfinite(step0) or step0 <= 0.0:
-        raise ValueError("sample_step must be finite and greater than zero.")
-    if uniform_metric not in {"cv", "std", "var"}:
-        raise ValueError("uniform_metric must be 'cv', 'std', or 'var'.")
-    win = int(np.ceil(1.5 * d / step0))
-
-    uniform_every = max(1, int(uniform_every))
-    uniform_window = max(4, int(uniform_window))
-    uniform_patience = max(1, int(uniform_patience))
-
-    # 1. 提取圆弧的 2D 平面投影几何 (M, u, v, radius)
-    arcs = _extract_arc_geometries(trajectory)
-
-    lower_idx = [i for i, s in enumerate(trajectory)
-                 if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "LOWER"]
-    upper_idx = [i for i, s in enumerate(trajectory)
-                 if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "UPPER"]
-    center_idx = [i for i, s in enumerate(trajectory)
-                  if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "CENTER"]
-
-    if not center_idx:
-        return trajectory
-
-    fixed_idx = lower_idx + upper_idx
-
-    fixed_pts = (np.vstack([np.asarray(trajectory[i].xyz, float) for i in fixed_idx])
-                 if fixed_idx else np.empty((0, 3)))
-    tri_centers = np.asarray(mesh.triangles_center, dtype=float)
-
-    lines = [_resample_polyline(np.asarray(trajectory[i].xyz, float), step0)
-             for i in center_idx]
-    endpoints = [(L[0].copy(), L[-1].copy()) for L in lines]
-    num_lines = len(lines)
-
-    # =========================================================
-    # 新增：用于均匀性判断的固定喷涂点、顶点树、顶点面积权重
-    # =========================================================
-    center_spray_flags = [
-        bool(getattr(trajectory[si], "spray_on", True))
-        for si in center_idx
-    ]
-
-    fixed_spray_pts = np.empty((0, 3), dtype=float)
-    if uniform_stop and fixed_idx:
-        fblocks = []
-        for i in fixed_idx:
-            seg = trajectory[i]
-            if not bool(getattr(seg, "spray_on", True)):
-                continue
-
-            xyz = np.asarray(seg.xyz, dtype=float)
-            if len(xyz) >= 2:
-                fblocks.append(_resample_polyline(xyz, step0))
-            elif len(xyz) == 1:
-                fblocks.append(xyz)
-
-        if fblocks:
-            fixed_spray_pts = np.vstack(fblocks)
-
-    u_radius = float(d if uniform_radius is None else uniform_radius)
-    if u_radius <= 0.0:
-        u_radius = d
-
-    n_vertices = len(mesh.vertices)
-    vert_tree = None
-    vertex_weights = None
-
-    if uniform_stop and n_vertices > 0:
-        vert_tree = cKDTree(mesh.vertices)
-
-        if uniform_use_area_weights and len(getattr(mesh, "faces", [])) > 0:
-            vertex_weights = np.zeros(n_vertices, dtype=float)
-            face_areas = np.asarray(mesh.area_faces, dtype=float)
-
-            np.add.at(vertex_weights, mesh.faces[:, 0], face_areas / 3.0)
-            np.add.at(vertex_weights, mesh.faces[:, 1], face_areas / 3.0)
-            np.add.at(vertex_weights, mesh.faces[:, 2], face_areas / 3.0)
-
-            if vertex_weights.sum() <= 0.0:
-                vertex_weights = np.ones(n_vertices, dtype=float)
+            # 不再返回 UV 空间：uv 置为 NaN
+            optimized.append(TrajectorySegment(
+                kind=seg.kind,
+                uv=np.full((len(final_xyz), 2), np.nan),
+                xyz=final_xyz,
+                spray_on=seg.spray_on,
+                note=seg.note + f" [3D Arc R={R:.2f}]",
+                region=seg.region,
+            ))
         else:
-            vertex_weights = np.ones(n_vertices, dtype=float)
+            # CENTER 中间区域及 OVERTRAVEL 等过渡段原封不动
+            optimized.append(seg)
 
-    def _spray_field(spray_pts: np.ndarray) -> np.ndarray:
-        """
-        统计所有喷涂点对 mesh.vertices 的贡献场。
-
-        衰减函数使用 smoothstep:
-            w(t) = 1 - 3t^2 + 2t^3
-
-        满足:
-            t = 0    -> 1
-            t = 0.5  -> 0.5
-            t = 1    -> 0
-        """
-        field = np.zeros(n_vertices, dtype=float)
-
-        if not uniform_stop:
-            return field
-
-        if vert_tree is None:
-            return field
-
-        if len(spray_pts) == 0:
-            return field
-
-        spray_tree = cKDTree(spray_pts)
-
-        # rows: spray points
-        # cols: mesh vertices
-        coo = spray_tree.sparse_distance_matrix(
-            vert_tree,
-            u_radius,
-            output_type="coo_matrix"
-        )
-
-        if coo.nnz == 0:
-            return field
-
-        t = np.asarray(coo.data, dtype=float) / u_radius
-        t = np.clip(t, 0.0, 1.0)
-
-        # smoothstep 衰减
-        w = 1.0 - 3.0 * t * t + 2.0 * t * t * t
-
-        # 数值上接近 0 的可以直接丢掉
-        keep = w > 1e-12
-        if not np.any(keep):
-            return field
-
-        cols = coo.col[keep]
-        ww = w[keep]
-
-        field = np.bincount(
-            cols,
-            weights=ww,
-            minlength=n_vertices
-        ).astype(float)
-
-        return field
-
-    def _uniform_value(field: np.ndarray) -> float:
-        """
-        根据顶点贡献场计算均匀性指标。
-
-        默认使用面积加权 CV：
-            CV = weighted_std / weighted_mean
-        """
-        if vertex_weights is None:
-            return float("inf")
-
-        # 所有模型顶点都必须参加统计，field == 0 表示该处没有被覆盖。
-        # 不能排除零贡献点，否则局部喷得均匀、大片区域漏喷时也可能得到很小的 CV。
-        valid = (
-                np.isfinite(field)
-                & np.isfinite(vertex_weights)
-                & (vertex_weights > 0.0)
-        )
-        if not np.any(valid):
-            return float("inf")
-
-        vals = field[valid]
-        w = vertex_weights[valid]
-
-        wsum = float(np.sum(w))
-        if wsum <= 0.0:
-            return float("inf")
-
-        mean = float(np.sum(vals * w) / wsum)
-        if mean <= uniform_active_eps:
-            return float("inf")
-
-        var = float(np.sum(w * (vals - mean) ** 2) / wsum)
-        var = max(0.0, var)
-        std = float(np.sqrt(var))
-
-        if uniform_metric == "std":
-            return std
-
-        if uniform_metric == "var":
-            return var
-
-        return std / mean
-
-    # =========================================================
-    # 新增：收敛判断状态
-    # =========================================================
-    metric_history = []
-    smoothed_metric = None
-    small_count = 0
-    best_metric = float("inf")
-    best_lines = None
-    evaluations_since_best = 0
-    last_uniform_delta = float("nan")
-    last_uniform_relative_delta = float("nan")
-    last_uniform_threshold = float("nan")
-    stop_reason = None
-
-    blanks, void_depth = [], 0.0
-
-    for it in range(iterations):
-        P = np.vstack(lines)
-        line_id = np.concatenate([np.full(len(L), li, np.int64) for li, L in enumerate(lines)])
-        local_id = np.concatenate([np.arange(len(L)) for L in lines])
-        offsets = np.r_[0, np.cumsum([len(L) for L in lines])]
-
-        if it % recompute_blank_every == 0:
-            blanks, void_depth = _void_centers(tri_centers, fixed_pts, P, d)
-
-        large_void = void_depth > 1.2 * d
-        R = float(influence_radius) if influence_radius is not None \
-            else (4.5 * d if large_void else 3.0 * d)
-
-        F = np.zeros_like(P)
-
-        # --- A. 空白区引导引力 ---
-        for c in blanks:
-            dvec = c - P
-            dist = np.maximum(np.linalg.norm(dvec, axis=1), 1e-6)
-            gate = np.clip(1.0 - (dist / R) ** 2, 0.0, 1.0) ** 2
-            F += (attract_weight * gate)[:, None] * (dvec / dist[:, None])
-
-        tc = cKDTree(P)
-
-        # ? --- B. 圆弧影响区 (r ~ r+d) 内的动态阶梯外推 ---
-        for arc in arcs:
-            m = arc["midpoint"]
-            u = arc["u"]
-            v = arc["v"]
-            r = arc["radius"]
-
-            inside_lines_info = []
-            for li in range(num_lines):
-                a, b = int(offsets[li]), int(offsets[li + 1])
-                curr_L = P[a:b]
-
-                rel = curr_L - m
-                x = rel @ u
-                y = rel @ v
-
-                r_max = r + 1.0 * d
-                mask = (y >= -0.5 * d) & (x ** 2 + y ** 2 <= r_max ** 2)
-                if np.any(mask):
-                    inside_lines_info.append((li, a, b, curr_L, x, y))
-
-            k = len(inside_lines_info)
-            if k == 0:
-                continue
-
-            inside_lines_info.sort(
-                key=lambda item: float(np.mean(np.linalg.norm(item[3] - m, axis=1)))
-            )
-
-            for idx, (li, a, b, curr_L, x, y) in enumerate(inside_lines_info):
-                frac = (idx + 1.0) / (k + 1.0)
-                r_target = r + frac * 1.0 * d
-
-                valid_x = np.abs(x) <= r_target
-                y_target = np.zeros_like(x)
-                y_target[valid_x] = np.sqrt(np.maximum(0.0, r_target ** 2 - x[valid_x] ** 2))
-
-                inside_mask = (y >= -0.5 * d) & (x ** 2 + y ** 2 <= r_target ** 2) & (y < y_target)
-
-                F_sub = F[a:b]
-                if np.any(inside_mask):
-                    depth = np.maximum(0.0, y_target[inside_mask] - y[inside_mask])
-                    mag = arc_repel_weight * (3.0 + 10.0 * (depth / d) ** 2)
-                    F_sub[inside_mask] += v[None, :] * mag[:, None]
-
-        # 基础 3D 距离微调排斥
-        if len(fixed_pts):
-            coo = cKDTree(fixed_pts).sparse_distance_matrix(tc, 0.8 * d, output_type="coo_matrix")
-            r_, c_, dv = coo.row, coo.col, coo.data
-            ok = dv > 1e-6
-            r_, c_, dv = r_[ok], c_[ok], dv[ok]
-            mag = 0.8 * arc_repel_weight * np.maximum(0.0, (0.8 * d - dv) / d)
-            np.add.at(F, c_, (P[c_] - fixed_pts[r_]) / dv[:, None] * mag[:, None])
-
-        # --- C. 同线与局部节点自排斥力 ---
-        coo = tc.sparse_distance_matrix(tc, 1.8 * d, output_type="coo_matrix")
-        r_, c_, dv = coo.row, coo.col, coo.data
-        ok = (dv > 1e-6) & (r_ != c_)
-        same = line_id[r_] == line_id[c_]
-        ok &= ~(same & (np.abs(local_id[r_] - local_id[c_]) <= win))
-        r_, c_, dv = r_[ok], c_[ok], dv[ok]
-        mag = self_repel_weight * (1.0 - dv / (1.8 * d))
-        np.add.at(F, c_, (P[c_] - P[r_]) / dv[:, None] * mag[:, None])
-
-        # --- D. 沿线纵向顺向平滑 ---
-        for li in range(num_lines):
-            a, b = int(offsets[li]), int(offsets[li + 1])
-            if b - a > 2:
-                F[a + 1:b - 1] += elastic_weight * (P[a:b - 2] - 2 * P[a + 1:b - 1] + P[a + 2:b])
-
-        # --- E. 跨线网格调和中点场 ---
-        if num_lines >= 2:
-            line_kdtrees = [cKDTree(L) for L in lines]
-
-            for li in range(1, num_lines - 1):
-                a, b = int(offsets[li]), int(offsets[li + 1])
-                curr_L = P[a:b]
-
-                _, idx_prev = line_kdtrees[li - 1].query(curr_L)
-                _, idx_next = line_kdtrees[li + 1].query(curr_L)
-
-                pt_prev = lines[li - 1][idx_prev]
-                pt_next = lines[li + 1][idx_next]
-
-                mid_target = 0.5 * (pt_prev + pt_next)
-                F[a:b] += transverse_weight * (mid_target - curr_L)
-
-            # 首尾轨迹线的软约束
-            a0, b0 = int(offsets[0]), int(offsets[1])
-            _, idx1 = line_kdtrees[1].query(P[a0:b0])
-            pt1 = lines[1][idx1]
-            d_vec0 = P[a0:b0] - pt1
-            dist0 = np.maximum(np.linalg.norm(d_vec0, axis=1), 1e-6)
-            F[a0:b0] -= 0.08 * transverse_weight * ((dist0 - d) / d)[:, None] * (d_vec0 / dist0[:, None])
-
-            if num_lines >= 3:
-                an, bn = int(offsets[num_lines - 1]), int(offsets[num_lines])
-                _, idx_prev_n = line_kdtrees[num_lines - 2].query(P[an:bn])
-                pt_prev_n = lines[num_lines - 2][idx_prev_n]
-                d_vecn = P[an:bn] - pt_prev_n
-                distn = np.maximum(np.linalg.norm(d_vecn, axis=1), 1e-6)
-                F[an:bn] -= 0.08 * transverse_weight * ((distn - d) / d)[:, None] * (d_vecn / distn[:, None])
-
-        # --- F. 位移上限控制与退火 ---
-        max_step = d * (0.05 + 0.35 * (anneal ** it))
-        norm = np.maximum(np.linalg.norm(F, axis=1), 1e-12)
-        P += F * np.clip(max_step / norm, 0.0, 1.0)[:, None]
-
-        # 投影回 3D 曲面 + 钉死端点
-        P, _, _ = trimesh.proximity.closest_point(mesh, P)
-        new_lines = []
-        for li in range(num_lines):
-            a, b = int(offsets[li]), int(offsets[li + 1])
-            L = P[a:b]
-            L[0], L[-1] = endpoints[li]
-            new_lines.append(L)
-        lines = new_lines
-
-        if (it + 1) % resample_every == 0:
-            lines = [_resample_polyline(L, step0) for L in lines]
-
-        # =========================================================
-        # 新增：计算喷涂贡献均匀性，并判断是否停止
-        # =========================================================
-        uniform_metric_current = None
-        should_stop = False
-
-        if (
-                uniform_stop
-                and vertex_weights is not None
-                and ((it + 1) % uniform_every == 0)
-        ):
-            spray_blocks = []
-
-            if uniform_include_fixed and len(fixed_spray_pts) > 0:
-                spray_blocks.append(fixed_spray_pts)
-
-            for li, L in enumerate(lines):
-                if center_spray_flags[li]:
-                    spray_blocks.append(L)
-
-            if spray_blocks:
-                spray_pts = np.vstack(spray_blocks)
-            else:
-                spray_pts = np.empty((0, 3), dtype=float)
-
-            field = _spray_field(spray_pts)
-            metric = _uniform_value(field)
-            uniform_metric_current = metric
-
-            if np.isfinite(metric):
-                metric_history.append(float(metric))
-
-                # EMA 平滑
-                if smoothed_metric is None:
-                    smoothed_metric = float(metric)
-                    last_uniform_delta = float("nan")
-                    last_uniform_relative_delta = float("nan")
-                    last_uniform_threshold = float("nan")
-                else:
-                    prev_smoothed = float(smoothed_metric)
-                    smoothed_metric = 0.7 * prev_smoothed + 0.3 * float(metric)
-
-                    delta = abs(smoothed_metric - prev_smoothed)
-                    convergence_threshold = (
-                            uniform_abs_tol
-                            + uniform_rel_tol * abs(prev_smoothed)
-                    )
-                    last_uniform_delta = float(delta)
-                    last_uniform_relative_delta = float(
-                        delta / max(abs(prev_smoothed), 1.0e-12)
-                    )
-                    last_uniform_threshold = float(convergence_threshold)
-
-                    if delta <= convergence_threshold:
-                        small_count += 1
-                    else:
-                        small_count = 0
-
-                # 用原始 CV 保存历史最优轨迹；EMA 只用于判断是否稳定。
-                improvement_tol = (
-                    uniform_abs_tol
-                    + uniform_rel_tol * max(abs(best_metric), 1.0e-12)
-                    if np.isfinite(best_metric)
-                    else 0.0
-                )
-                if metric < best_metric - improvement_tol:
-                    best_metric = float(metric)
-                    best_lines = [L.copy() for L in lines]
-                    evaluations_since_best = 0
-                else:
-                    evaluations_since_best += 1
-
-                # 真正的往返波动：总体漂移很小、窗口振幅不大、且至少反向两次。
-                recent = np.asarray(metric_history[-uniform_window:], dtype=float)
-                oscillating = False
-                relative_drift = float("inf")
-                relative_range = float("inf")
-                direction_changes = 0
-                if len(recent) >= uniform_window:
-                    scale = max(abs(float(np.mean(recent))), 1.0e-12)
-                    relative_drift = abs(float(recent[-1] - recent[0])) / scale
-                    relative_range = float(np.ptp(recent)) / scale
-                    differences = np.diff(recent)
-                    significant = np.abs(differences) > (
-                            uniform_abs_tol + uniform_rel_tol * scale
-                    )
-                    directions = np.sign(differences[significant])
-                    if len(directions) >= 2:
-                        direction_changes = int(
-                            np.sum(directions[1:] * directions[:-1] < 0.0)
-                        )
-                    oscillating = (
-                            relative_drift <= uniform_oscillation_tol
-                            and relative_range <= uniform_oscillation_tol
-                            and direction_changes >= 2
-                            and evaluations_since_best >= uniform_patience
-                    )
-
-                # 前面仍记录指标和历史最佳，但达到最小迭代次数后才允许停止。
-                can_stop = (it + 1) >= uniform_min_iterations
-
-                # 停止条件 1：平滑 CV 连续多次几乎不变。
-                if can_stop and small_count >= uniform_patience:
-                    stop_reason = (
-                        f"Uniformity converged at iteration {it + 1}: "
-                        f"metric={metric:.6g}, smoothed={smoothed_metric:.6g}, "
-                        f"best={best_metric:.6g}"
-                    )
-                    should_stop = True
-
-                # 停止条件 2：CV 在小范围内反复升降，且已多次没有刷新最优值。
-                elif can_stop and oscillating:
-                    stop_reason = (
-                        f"Uniformity oscillation stabilized at iteration {it + 1}: "
-                        f"metric={metric:.6g}, smoothed={smoothed_metric:.6g}, "
-                        f"relative_drift={relative_drift:.6g}, "
-                        f"relative_range={relative_range:.6g}, "
-                        f"direction_changes={direction_changes}, "
-                        f"best={best_metric:.6g}"
-                    )
-                    should_stop = True
-
-        # 原有的回调
-        if on_iteration is not None and (
-                (it + 1) % 3 == 0 or it == iterations - 1 or should_stop
-        ):
-            total_energy, energy_components = _trajectory_objective(
-                tri_centers=tri_centers,
-                fixed_pts=fixed_pts,
-                lines=lines,
-                target_spacing=d,
-                coverage_weight=attract_weight,
-                spacing_weight=self_repel_weight + transverse_weight,
-                boundary_weight=arc_repel_weight,
-                smooth_weight=elastic_weight,
-            )
-
-            # 如果 energy_components 是 dict，就把均匀性指标塞进去，方便可视化
-            if uniform_stop and metric_history and isinstance(energy_components, dict):
-                energy_components = dict(energy_components)
-                energy_components["uniform_metric"] = metric_history[-1]
-                energy_components["uniform_metric_smoothed"] = smoothed_metric
-                energy_components["uniform_metric_best"] = best_metric
-                energy_components["uniform_delta"] = last_uniform_delta
-                energy_components["uniform_relative_delta"] = last_uniform_relative_delta
-                energy_components["uniform_relative_tol"] = uniform_rel_tol
-                energy_components["uniform_threshold"] = last_uniform_threshold
-                energy_components["uniform_stable_count"] = small_count
-                energy_components["uniform_patience"] = uniform_patience
-                if uniform_metric_current is not None:
-                    energy_components["uniform_metric_current"] = uniform_metric_current
-                if stop_reason is not None:
-                    energy_components["uniform_stop_reason"] = stop_reason
-
-            preview = list(trajectory)
-
-            for k, si in enumerate(center_idx):
-                orig = trajectory[si]
-                n_k = len(lines[k])
-                # 根据重新采样后的点数赋予前 50% 为 0，后 50% 为 1
-                k_phases = np.where(np.arange(n_k) < n_k // 2, 0, 1)
-                preview[si] = TrajectorySegment(
-                    kind=orig.kind,
-                    uv=np.full((n_k, 2), np.nan),
-                    xyz=lines[k].copy(),
-                    spray_on=orig.spray_on,
-                    note=orig.note + " [Optimizing]",
-                    region=orig.region,
-                    phases=k_phases,  # 【补充】
-                )
-
-            on_iteration(preview, it + 1, total_energy, energy_components)
-
-        if should_stop:
-            print(f"\n[Uniformity early stop] {stop_reason}")
-            break
-
-    # 如果开启了 return_best_uniform，则返回历史最优版本
-    if uniform_stop and return_best_uniform and best_lines is not None:
-        lines = best_lines
-
-    out = list(trajectory)
-
-    note_suffix = " [Global Arc-Distance Energy Optimized]"
-    if stop_reason is not None:
-        note_suffix = " [Global Arc-Distance Energy Optimized, Uniformity Early Stop]"
-
-    for k, si in enumerate(center_idx):
-        orig = trajectory[si]
-        n_k = len(lines[k])
-        k_phases = np.where(np.arange(n_k) < n_k // 2, 0, 1)
-        out[si] = TrajectorySegment(
-            kind=orig.kind,
-            uv=np.full((n_k, 2), np.nan),
-            xyz=lines[k],
-            spray_on=orig.spray_on,
-            note=orig.note + note_suffix,
-            region=orig.region,
-            phases=k_phases,  # 【补充】f
-        )
-
-    return out
-
+    return optimized
 
 def generate_seam_aware_trajectory(
         data: ObjUVData,
@@ -3193,39 +2236,18 @@ def generate_seam_aware_trajectory(
 
         # 直接在 3D 切缝点将 first 和 second 合并为一条连续的表面喷涂轨迹
         # 1. 合并 Master (first) 和 Slave (second) 的 2D 与 3D 坐标
-        # =========================================================================
-        # LOWER / UPPER 拼接部分修改示例
-        # =========================================================================
-
-        # 1. 生成 Master (first) 和 Slave (second) 各自的 phase
-        phase_first = np.zeros(len(first.xyz), dtype=int)  # 0: 前半部分 / Master
-        phase_second = np.ones(len(second.xyz), dtype=int)  # 1: 后半部分 / Slave
-
-        # 2. 合并坐标与标识
         merged_uv = np.vstack([first.uv, second.uv])
-        merged_xyz = np.vstack([first.xyz, second.xyz])
-        merged_phases = np.concatenate([phase_first, phase_second])  # 拼接 phases
-
-        # 3. 进行 3D 去重与平滑（smooth_v_trajectory 会改变点数，需同步处理 phases）
-        clean_xyz = smooth_v_trajectory(merged_xyz, min_distance=0.2, smooth_iterations=2)
-
-        # 如果去重改变了点数，根据相对比例重构 phases
-        if len(clean_xyz) != len(merged_phases):
-            # 前 50% 弧长的点标记为 0，后 50% 标记为 1（或按原始比例计算）
-            split_ratio = len(first.xyz) / len(merged_xyz)
-            clean_phases = np.where(np.linspace(0.0, 1.0, len(clean_xyz)) < split_ratio, 0, 1)
-        else:
-            clean_phases = merged_phases
-
-        # 4. 构造带有 phases 标志的 TrajectorySegment
+        merged_xyz = np.vstack([first.xyz, second.xyz])  # <-- 这里定义了 merged_xyz
+        clean_xyz = smooth_v_trajectory(
+            merged_xyz, min_distance=0.2, smooth_iterations=2
+        )
+        # 3. 构造轨迹对象（使用平滑后的 clean_xyz）
         merged_segment = TrajectorySegment(
             kind="SURFACE_SCAN",
             uv=merged_uv,
             xyz=clean_xyz,
             spray_on=True,
             note=f"{labels[0]} -> {labels[1]}",
-            region="LOWER",  # 或 "UPPER"
-            phases=clean_phases  # 【传入标识】
         )
 
         # 4. 追加到主轨迹列表
@@ -3315,13 +2337,8 @@ def generate_seam_aware_trajectory(
 
         # ======================= 【修改开始】 =======================
         # 将 Master 和 Slave 合并为一段连续的 SURFACE_SCAN，不再插入 SEAM_JUMP
-        # 生成 Master 和 Slave 各自的 phase
-        phase_first = np.zeros(len(first.xyz), dtype=int)  # 0: 前半部分 / Master
-        phase_second = np.ones(len(second.xyz), dtype=int)  # 1: 后半部分 / Slave
-
         merged_uv = np.vstack([first.uv, second.uv])
         merged_xyz = np.vstack([first.xyz, second.xyz])
-        merged_phases = np.concatenate([phase_first, phase_second])  # 【新增】拼接 phases
 
         merged_segment = TrajectorySegment(
             kind="SURFACE_SCAN",
@@ -3329,9 +2346,9 @@ def generate_seam_aware_trajectory(
             xyz=merged_xyz,
             spray_on=True,
             note=f"{labels[0]} -> {labels[1]}",
-            region="UPPER",
-            phases=merged_phases  # 【补充传入 phases】
+            region="UPPER"  # 【新增】
         )
+
         # 一次性将合并后的整段轨迹加入列表
         append_surface(
             merged_segment,
@@ -3698,6 +2715,25 @@ def vtk_polyline(points_array: np.ndarray) -> vtk.vtkPolyData:
     return polydata
 
 
+def _finite_polyline_parts(points_array: np.ndarray) -> list[np.ndarray]:
+    points = np.asarray(points_array, dtype=float)
+    if points.ndim != 2 or points.shape[1] < 3:
+        return []
+    finite = np.isfinite(points[:, :3]).all(axis=1)
+    parts = []
+    start = None
+    for index, valid in enumerate(finite):
+        if valid and start is None:
+            start = index
+        elif not valid and start is not None:
+            if index - start >= 2:
+                parts.append(points[start:index, :3])
+            start = None
+    if start is not None and len(points) - start >= 2:
+        parts.append(points[start:, :3])
+    return parts
+
+
 def vtk_points(points_array: np.ndarray) -> vtk.vtkPolyData:
     points = vtk.vtkPoints()
     for pt in points_array:
@@ -3712,30 +2748,54 @@ def vtk_points(points_array: np.ndarray) -> vtk.vtkPolyData:
     return polydata
 
 
+
+
+def vtk_tube(polydata: vtk.vtkPolyData, radius: float = 0.4, num_sides: int = 8) -> vtk.vtkPolyData:
+    """利用 vtkTubeFilter 将 1D 线性 PolyData 膨胀生成真正的 3D 圆柱形管道网格"""
+    tube_filter = vtk.vtkTubeFilter()
+    tube_filter.SetInputData(polydata)
+    tube_filter.SetRadius(radius)
+    tube_filter.SetNumberOfSides(num_sides)
+    tube_filter.CappingOn()  # 封盖首尾
+    tube_filter.Update()
+    return tube_filter.GetOutput()
+
+
 def vtk_actor(polydata: vtk.vtkPolyData, color: tuple[float, float, float], opacity: float = 0.90,
               width: float = 1.0, wireframe: bool = False) -> vtk.vtkActor:
     mapper = vtk.vtkPolyDataMapper()
     mapper.SetInputData(polydata)
 
-    # 【防 Z-fighting 增强】：强制 VTK 在光栅化时给线/面添加微小的深度偏移
+    # 深度偏移（向视口摄像机前置拉伸），从根本上消除曲面共面闪烁 (Z-fighting)
     mapper.SetResolveCoincidentTopologyToPolygonOffset()
-    # 针对线段的特定偏移参数（将线微微向摄像机方向拉出）
     try:
+        mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-1.0, -1.0)
         mapper.SetResolveCoincidentTopologyLineOffsetParameters(-1.0, -1.0)
     except AttributeError:
-        pass  # 兼容旧版 VTK
+        pass
 
     actor = vtk.vtkActor()
     actor.SetMapper(mapper)
     actor.GetProperty().SetColor(*color)
     actor.GetProperty().SetOpacity(opacity)
-
-    # 【视觉增强】：将线段渲染为实体细管，能大幅减少共面闪烁，且视觉效果更高级
     actor.GetProperty().SetLineWidth(width)
     actor.GetProperty().SetRenderLinesAsTubes(False)
 
     if wireframe:
         actor.GetProperty().SetRepresentationToWireframe()
+    return actor
+
+
+def _style_trajectory_actor(actor: vtk.vtkActor, color: tuple[float, float, float]) -> vtk.vtkActor:
+    """Make trajectory geometry readable against the shaded mesh."""
+    actor.GetProperty().SetColor(*color)
+    actor.GetProperty().SetOpacity(1.0)
+    actor.GetProperty().LightingOff()
+    actor.GetProperty().SetAmbient(1.0)
+    actor.GetProperty().SetDiffuse(0.0)
+    if hasattr(actor.GetProperty(), "SetDisplayLocationToForeground"):
+        actor.GetProperty().SetDisplayLocationToForeground()
+    actor.SetForceOpaque(True)
     return actor
 
 
@@ -3746,8 +2806,7 @@ def add_title(renderer: vtk.vtkRenderer, text: str) -> None:
     actor.SetPosition(18, 18)
     actor.GetTextProperty().SetFontSize(16)
     actor.GetTextProperty().SetColor(0.12, 0.12, 0.12)
-    renderer.AddViewProp(actor)  # 改为 AddViewProp，消除 DeprecationWarning
-
+    renderer.AddViewProp(actor)  # 由 AddActor 改为 AddViewProp
 
 def add_penalty_chart(renderer: vtk.vtkRenderer, candidates: np.ndarray, objectives: np.ndarray,
                       optimized_d: float, optimized_f: float) -> vtk.vtkContextActor:
@@ -3801,67 +2860,6 @@ def add_penalty_chart(renderer: vtk.vtkRenderer, candidates: np.ndarray, objecti
     return context
 
 
-def add_energy_history_chart(
-        renderer: vtk.vtkRenderer,
-        iterations: Sequence[int],
-        energies: Sequence[float],
-) -> vtk.vtkContextActor:
-    """Draw the total-energy history accumulated during live optimization."""
-    table = vtk.vtkTable()
-    iteration_values = vtk.vtkDoubleArray()
-    energy_values = vtk.vtkDoubleArray()
-    iteration_values.SetName("iteration")
-    energy_values.SetName("total objective E")
-    for iteration, energy in zip(iterations, energies):
-        iteration_values.InsertNextValue(float(iteration))
-        energy_values.InsertNextValue(float(energy))
-    table.AddColumn(iteration_values)
-    table.AddColumn(energy_values)
-
-    chart = vtk.vtkChartXY()
-    latest = float(energies[-1])
-    chart.SetTitle(f"Trajectory objective trend: E={latest:.6g}")
-    curve = chart.AddPlot(vtk.vtkChart.LINE)
-    curve.SetInputData(table, 0, 1)
-    curve.GetPen().SetColor(220, 20, 35, 255)
-    curve.GetPen().SetWidth(2.5)
-
-    marker = chart.AddPlot(vtk.vtkChart.POINTS)
-    marker.SetInputData(table, 0, 1)
-    marker.SetColor(25, 72, 205, 255)
-    marker.SetWidth(5.0)
-    marker.SetMarkerStyle(vtk.vtkPlotPoints.CIRCLE)
-
-    x_axis = chart.GetAxis(vtk.vtkAxis.BOTTOM)
-    y_axis = chart.GetAxis(vtk.vtkAxis.LEFT)
-    x_axis.SetTitle("iteration")
-    y_axis.SetTitle("total objective E")
-    x_axis.SetPrecision(0)
-    y_axis.SetNotation(vtk.vtkAxis.SCIENTIFIC_NOTATION)
-    y_axis.SetPrecision(4)
-
-    iteration_min = float(min(iterations))
-    iteration_max = float(max(iterations))
-    if iteration_max <= iteration_min:
-        iteration_min -= 1.0
-        iteration_max += 1.0
-    energy_min = float(min(energies))
-    energy_max = float(max(energies))
-    energy_padding = max(
-        0.06 * (energy_max - energy_min),
-        max(abs(energy_min), abs(energy_max), EPS) * 1.0e-3,
-    )
-    x_axis.SetBehavior(vtk.vtkAxis.FIXED)
-    x_axis.SetRange(iteration_min, iteration_max)
-    y_axis.SetBehavior(vtk.vtkAxis.FIXED)
-    y_axis.SetRange(energy_min - energy_padding, energy_max + energy_padding)
-
-    context = vtk.vtkContextActor()
-    context.GetScene().AddItem(chart)
-    renderer.AddActor(context)
-    return context
-
-
 class InteractiveVisualizer:
     def __init__(self, mesh: trimesh.Trimesh, data: ObjUVData, precut_seam: PrecutSeam,
                  cut_edges: np.ndarray, sample_step: float, initial_spacing: float,
@@ -3880,42 +2878,47 @@ class InteractiveVisualizer:
         self.spray_distance = spray_distance
         self.current_trajectory: list[TrajectorySegment] = []
         self.current_metadata: dict[str, object] | None = None
-        self.a_max = 1000.0  # 默认值
-        self.j_max = 5000.0  # 默认值
+
         self.hide_model = False
         self.hide_traj = False
 
         self.window = vtk.vtkRenderWindow()
         self.window.SetWindowName("OptCuts trajectory - VTK/OpenGL (Interactive)")
         self.window.SetSize(1600, 900)
-        self.window.SetMultiSamples(0)
         # 【新增】：1. 设置渲染窗口支持 2 个层级 (Layer 0 和 Layer 1)
+        # 1. 开启双层渲染架构
         self.window.SetNumberOfLayers(2)
 
-        # 底层渲染器 Layer 0：专门绘制 3D 网格模型
+        # 底层 Layer 0：专门绘制三维模型
         self.left_renderer = vtk.vtkRenderer()
         self.left_renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
         self.left_renderer.SetLayer(0)
+        self.left_renderer.SetBackground(0.96, 0.97, 0.98)
 
-        # 【新增】：2. 定义顶层渲染器 Layer 1（专门置顶绘制 3D 轨迹）
+        # 顶层 Layer 1：专门置顶绘制 3D 轨迹
         self.left_overlay_renderer = vtk.vtkRenderer()
         self.left_overlay_renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
         self.left_overlay_renderer.SetLayer(1)
+        # Match Aeigen: retain the mesh color buffer but disable depth testing
+        # against the mesh so the trajectory is always visible on top.
+        self.left_overlay_renderer.PreserveColorBufferOn()
+        self.left_overlay_renderer.PreserveDepthBufferOff()
         self.left_overlay_renderer.EraseOff()  # 透明背景
-        # 共享 3D 视角相机（旋转/平移/缩放自动完美同步）
+        # 共享 3D 摄像机（旋转/平移/缩放无缝同步）
         self.left_overlay_renderer.SetActiveCamera(self.left_renderer.GetActiveCamera())
 
+        # 右侧与下方图表渲染器
         self.right_renderer = vtk.vtkRenderer()
         self.right_renderer.SetViewport(0.5, 0.34, 1.0, 1.0)
         self.right_renderer.SetLayer(0)
+        self.right_renderer.SetBackground(0.96, 0.97, 0.98)
 
         self.chart_renderer = vtk.vtkRenderer()
         self.chart_renderer.SetViewport(0.5, 0.0, 1.0, 0.34)
         self.chart_renderer.SetLayer(0)
+        self.chart_renderer.SetBackground(0.96, 0.97, 0.98)
 
         for ren in (self.left_renderer, self.left_overlay_renderer, self.right_renderer, self.chart_renderer):
-            if ren != self.left_overlay_renderer:
-                ren.SetBackground(0.96, 0.97, 0.98)
             self.window.AddRenderer(ren)
 
         self.vertices_3d = np.asarray(self.mesh.vertices, float)
@@ -3925,8 +2928,7 @@ class InteractiveVisualizer:
         self.left_renderer.AddActor(self.mesh_actor_3d)
 
         uv3 = np.column_stack([self.data.uv, np.zeros(len(self.data.uv))])
-        self.mesh_actor_2d = vtk_actor(vtk_mesh(uv3, self.data.uv_faces), (0.62, 0.66, 0.70), opacity=0.30,
-                                       wireframe=True)
+        self.mesh_actor_2d = vtk_actor(vtk_mesh(uv3, self.data.uv_faces), (0.62, 0.66, 0.70), opacity=0.30, wireframe=True)
         self.right_renderer.AddActor(self.mesh_actor_2d)
 
         add_title(self.left_renderer, "3D seam-aware spray trajectory")
@@ -3936,12 +2938,9 @@ class InteractiveVisualizer:
         self.trajectory_actors_2d = []
         self.chart_context_actor = None
         self.text_actor_2d_info = None
-        self.energy_iterations: list[int] = []
-        self.energy_values: list[float] = []
 
         self.interactor = vtk.vtkRenderWindowInteractor()
         self.interactor.SetRenderWindow(self.window)
-        self.interactor.SetDesiredUpdateRate(30.0)
         self.interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
 
     def apply_visibility(self):
@@ -3954,14 +2953,6 @@ class InteractiveVisualizer:
             actor.SetVisibility(not self.hide_traj)
         self.window.Render()
 
-    def reset_energy_history(self) -> None:
-        self.energy_iterations.clear()
-        self.energy_values.clear()
-
-    def record_energy(self, iteration: int, total_energy: float) -> None:
-        self.energy_iterations.append(int(iteration))
-        self.energy_values.append(float(total_energy))
-
     def update_trajectory(self, trajectory: Sequence[TrajectorySegment], planning_frame: PlanningFrame,
                           metadata: dict[str, object],
                           trajectory_2d: Sequence[TrajectorySegment] | None = None):
@@ -3969,7 +2960,7 @@ class InteractiveVisualizer:
         self.current_metadata = metadata
         display_2d = trajectory_2d if trajectory_2d is not None else trajectory
 
-        # 1. 清理原有的 3D 和 2D 轨迹 Actor
+        # 1. 清理原有的 Actor
         for actor in self.trajectory_actors_3d:
             self.left_overlay_renderer.RemoveActor(actor)
         self.trajectory_actors_3d.clear()
@@ -3980,123 +2971,89 @@ class InteractiveVisualizer:
 
         if self.chart_context_actor:
             self.chart_renderer.RemoveActor(self.chart_context_actor)
-
         if self.text_actor_2d_info:
             self.right_renderer.RemoveActor(self.text_actor_2d_info)
 
-        # === 【3D 轨迹绘制 - Actor 合并极速渲染（添加到 Layer 1 顶层渲染器）】 ===
+        # === 【3D 轨迹：使用 Append 合并后生成 3D 实心圆管（极速、不卡顿）】 ===
         scan_append_3d = vtk.vtkAppendPolyData()
         overtravel_append_3d = vtk.vtkAppendPolyData()
-        blend_append_3d = vtk.vtkAppendPolyData()
 
         has_scan = False
         has_overtravel = False
-        has_blend = False
 
         for seg in trajectory:
             if len(seg.xyz) < 2:
                 continue
-            poly = vtk_polyline(seg.xyz)
-            if seg.kind == "SURFACE_SCAN":
-                scan_append_3d.AddInputData(poly)
-                has_scan = True
-            elif seg.kind == "OVERTRAVEL":
-                overtravel_append_3d.AddInputData(poly)
-                has_overtravel = True
-            elif seg.kind == "SEAM_BLEND_3D":
-                blend_append_3d.AddInputData(poly)
-                has_blend = True
+            for part in _finite_polyline_parts(seg.xyz):
+                poly = vtk_polyline(part)
+                if seg.kind == "SURFACE_SCAN":
+                    scan_append_3d.AddInputData(poly)
+                    has_scan = True
+                elif seg.kind in ("OVERTRAVEL", "SEAM_BLEND_3D"):
+                    overtravel_append_3d.AddInputData(poly)
+                    has_overtravel = True
 
-        # 绘制主喷涂轨迹 (红色)
+        # 主喷涂轨迹：红色实心立体圆管 (半宽半径默认 0.35mm)
         if has_scan:
             scan_append_3d.Update()
-            actor = vtk_actor(scan_append_3d.GetOutput(), (0.86, 0.05, 0.08), width=3.5)
+            actor = _style_trajectory_actor(vtk_actor(scan_append_3d.GetOutput(), (1.0, 0.10, 0.02), opacity=1.0, width=4.5), (1.0, 0.10, 0.02))
             self.left_overlay_renderer.AddActor(actor)
             self.trajectory_actors_3d.append(actor)
 
-        # 绘制过渡空跑轨迹 (绿色)
+        # 过渡空跑轨迹：绿色实心立体细管 (半径默认 0.25mm)
         if has_overtravel:
             overtravel_append_3d.Update()
-            actor = vtk_actor(overtravel_append_3d.GetOutput(), (0.0, 0.8, 0.0), width=2.5)
+            actor = _style_trajectory_actor(vtk_actor(overtravel_append_3d.GetOutput(), (0.05, 1.0, 0.08), opacity=1.0, width=4.0), (0.05, 1.0, 0.08))
             self.left_overlay_renderer.AddActor(actor)
             self.trajectory_actors_3d.append(actor)
 
-        # 绘制接缝平滑轨迹 (橙色)
-        if has_blend:
-            blend_append_3d.Update()
-            actor = vtk_actor(blend_append_3d.GetOutput(), (1.0, 0.5, 0.0), width=3.0)
-            self.left_overlay_renderer.AddActor(actor)
-            self.trajectory_actors_3d.append(actor)
-
-        # === 【2D 轨迹绘制 - Actor 合并】 ===
+        # === 【2D UV 轨迹：保持 2D 线框渲染】 ===
         scan_append_2d = vtk.vtkAppendPolyData()
         has_scan_2d = False
-
         for seg in display_2d:
             if seg.kind != "SURFACE_SCAN":
                 continue
             valid_uv = [uv for uv in seg.uv if np.isfinite(uv).all()]
             if len(valid_uv) < 2:
                 continue
-
             uv_arr = np.asarray(valid_uv)
             dists = np.linalg.norm(np.diff(uv_arr, axis=0), axis=1)
-            max_jump = 5.0 * self.sample_step
-            split_indices = np.where(dists > max_jump)[0] + 1
-            sub_lines = np.split(uv_arr, split_indices)
-
-            for line in sub_lines:
+            split_indices = np.where(dists > 5.0 * self.sample_step)[0] + 1
+            for line in np.split(uv_arr, split_indices):
                 if len(line) >= 2:
                     scan_append_2d.AddInputData(vtk_polyline(line))
                     has_scan_2d = True
 
         if has_scan_2d:
             scan_append_2d.Update()
-            actor_2d = vtk_actor(scan_append_2d.GetOutput(), (0.86, 0.05, 0.08), width=3.0)
+            actor_2d = _style_trajectory_actor(vtk_actor(scan_append_2d.GetOutput(), (1.0, 0.05, 0.0), width=5.0), (1.0, 0.05, 0.0))
             self.right_renderer.AddActor(actor_2d)
             self.trajectory_actors_2d.append(actor_2d)
 
-        # === 3. 绘制辅助参考线与点集 ===
+        # === 3. 辅助参考线与文本刷新 ===
         ref_line_pts = np.vstack([
             planning_frame.origin,
             planning_frame.origin + planning_frame.waist_width * planning_frame.x_axis
         ])
-        ref_actor = vtk_actor(vtk_polyline(ref_line_pts), (0.0, 0.8, 0.8), width=3.5)
+        ref_actor = vtk_actor(vtk_polyline(ref_line_pts), (0.0, 0.8, 0.8), width=3.0)
         self.right_renderer.AddActor(ref_actor)
         self.trajectory_actors_2d.append(ref_actor)
 
-        cut_uv_pts = []
-        for pair in self.precut_seam.cut_vertex_pairs:
-            for idx in pair:
-                if idx < len(self.data.uv):
-                    cut_uv_pts.append(self.data.uv[idx])
-        if cut_uv_pts:
-            pts_actor = vtk_actor(vtk_points(np.asarray(cut_uv_pts)), (0.1, 0.4, 0.8))
-            pts_actor.GetProperty().SetPointSize(8.0)
-            self.right_renderer.AddActor(pts_actor)
-            self.trajectory_actors_2d.append(pts_actor)
-
-        # === 4. 更新散点图和数据文本 ===
-        if self.energy_values:
-            self.chart_context_actor = add_energy_history_chart(
-                self.chart_renderer, self.energy_iterations, self.energy_values
-            )
-        else:
-            opt_curve = metadata["optimization_curve"]
-            candidates = np.asarray(opt_curve["spacing"])
-            objectives = np.asarray(opt_curve["objective"])
-            opt_d = metadata["optimized_spacing"]
-            opt_f = metadata["optimization_objective"]
-            self.chart_context_actor = add_penalty_chart(
-                self.chart_renderer, candidates, objectives, opt_d, opt_f
-            )
+        opt_curve = metadata["optimization_curve"]
+        self.chart_context_actor = add_penalty_chart(
+            self.chart_renderer,
+            np.asarray(opt_curve["spacing"]),
+            np.asarray(opt_curve["objective"]),
+            metadata["optimized_spacing"],
+            metadata["optimization_objective"]
+        )
 
         self.text_actor_2d_info = vtk.vtkTextActor()
         actual_spacings = metadata["actual_spacings"]
         info_text = f"Actual spacing  center: {actual_spacings['center']:.4f}  upper: {actual_spacings['upper_left']:.4f}  lower: {actual_spacings['lower_left']:.4f}"
         self.text_actor_2d_info.SetInput(info_text)
         self.text_actor_2d_info.SetPosition(400, 18)
-        self.text_actor_2d_info.GetTextProperty().SetFontSize(18)
+        self.text_actor_2d_info.GetTextProperty().SetFontSize(16)
         self.text_actor_2d_info.GetTextProperty().SetColor(0.12, 0.12, 0.12)
         self.right_renderer.AddViewProp(self.text_actor_2d_info)
 
@@ -4122,13 +3079,12 @@ class InteractiveVisualizer:
         camera2.SetViewUp(0, 1, 0)
         self.right_renderer.ResetCamera()
 
-
 class TkControlPanel:
     def __init__(self, visualizer: InteractiveVisualizer):  # 只需要接收 1 个 visualizer 参数
         self.visualizer = visualizer
         self.root = tk.Tk()
         self.root.title("控制台 - 属性控制")
-        self.root.geometry("400x330+50+50")
+        self.root.geometry("360x250+50+50")
         self.root.wm_attributes("-topmost", True)
 
         # Spacing update entry controls
@@ -4143,34 +3099,21 @@ class TkControlPanel:
         self.speed_entry.grid(row=1, column=1, padx=10, pady=6, sticky="ew")
 
         tk.Label(self.root, text="喷涂距离: ", font=("Arial", 11)).grid(row=2, column=0, padx=10, pady=6, sticky="w")
-
         self.spray_distance_var = tk.StringVar(value=f"{self.visualizer.spray_distance:.12g}")
         self.spray_distance_entry = tk.Entry(
             self.root, textvariable=self.spray_distance_var, width=15, font=("Arial", 11)
         )
         self.spray_distance_entry.grid(row=2, column=1, padx=10, pady=6, sticky="ew")
 
-        tk.Label(self.root, text="最大加速度 (mm/s²): ", font=("Arial", 11)).grid(row=3, column=0, padx=10, pady=6,
-                                                                                  sticky="w")
-        self.a_max_var = tk.StringVar(value="1000.0")  # 默认值，根据实际机器人设定
-        self.a_max_entry = tk.Entry(self.root, textvariable=self.a_max_var, width=15, font=("Arial", 11))
-        self.a_max_entry.grid(row=3, column=1, padx=10, pady=6, sticky="ew")
-
-        # 【新增】：最大加加速度输入
-        tk.Label(self.root, text="最大加加速度 (mm/s³): ", font=("Arial", 11)).grid(row=4, column=0, padx=10, pady=6,
-                                                                                    sticky="w")
-        self.j_max_var = tk.StringVar(value="5000.0")  # 默认值
-        self.j_max_entry = tk.Entry(self.root, textvariable=self.j_max_var, width=15, font=("Arial", 11))
-        self.j_max_entry.grid(row=4, column=1, padx=10, pady=6, sticky="ew")
-
-        # 原有的按钮行号下移
         self.btn = tk.Button(self.root, text="更新轨迹", command=self.update_spacing, font=("Arial", 11), bg="#1948CD",
                              fg="white")
-        self.btn.grid(row=5, column=0, padx=10, pady=5, sticky="ew")
+        self.btn.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
 
-        self.export_btn = tk.Button(self.root, text="导出轨迹", command=self.export_trajectory, font=("Arial", 11),
-                                    bg="#1948CD", fg="white")
-        self.export_btn.grid(row=5, column=1, padx=10, pady=5, sticky="ew")
+        self.export_btn = tk.Button(
+            self.root, text="导出轨迹", command=self.export_trajectory,
+            font=("Arial", 11), bg="#1948CD", fg="white"
+        )
+        self.export_btn.grid(row=3, column=1, padx=10, pady=5, sticky="ew")
 
         # Show/Hide checkboxes
         self.hide_model_var = tk.BooleanVar(value=False)
@@ -4178,14 +3121,14 @@ class TkControlPanel:
             self.root, text="隐藏三维网格模型", variable=self.hide_model_var, command=self.toggle_model,
             font=("Arial", 10)
         )
-        self.cb_model.grid(row=6, column=0, columnspan=2, sticky="w", padx=10, pady=2)
+        self.cb_model.grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=2)
 
         self.hide_traj_var = tk.BooleanVar(value=False)
         self.cb_traj = tk.Checkbutton(
             self.root, text="隐藏喷涂加工轨迹", variable=self.hide_traj_var, command=self.toggle_traj,
             font=("Arial", 10)
         )
-        self.cb_traj.grid(row=7, column=0, columnspan=2, sticky="w", padx=10, pady=2)
+        self.cb_traj.grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=2)
 
     def toggle_model(self):
         self.visualizer.hide_model = self.hide_model_var.get()
@@ -4219,28 +3162,21 @@ class TkControlPanel:
     def update_spacing(self):
         try:
             new_d = float(self.spacing_var.get())
+            if not np.isfinite(new_d) or new_d <= 0:
+                raise ValueError
             speed = float(self.speed_var.get())
+            if not np.isfinite(speed) or speed <= 0:
+                raise ValueError
             spray_distance = float(self.spray_distance_var.get())
-
-            # 【新增】：读取加速度和加加速度
-            a_max = float(self.a_max_var.get())
-            j_max = float(self.j_max_var.get())
-
-            if not np.isfinite(new_d) or new_d <= 0: raise ValueError
-            if not np.isfinite(speed) or speed <= 0: raise ValueError
-            if not np.isfinite(a_max) or a_max <= 0: raise ValueError
-            if not np.isfinite(j_max) or j_max <= 0: raise ValueError
-
+            if not np.isfinite(spray_distance):
+                raise ValueError
         except ValueError:
-            messagebox.showerror("错误", "参数必须为大于 0 的有效数字。")
+            messagebox.showerror("错误", "目标间距 d 必须是大于 0 的有效数字。")
             return
 
-        # 存储到 visualizer
         self.visualizer.current_spacing = new_d
         self.visualizer.trajectory_speed = speed
         self.visualizer.spray_distance = spray_distance
-        self.visualizer.a_max = a_max  # 【新增】
-        self.visualizer.j_max = j_max  # 【新增】
 
         raw_trajectory, planning_frame, metadata = generate_seam_aware_trajectory(
             self.visualizer.data,
@@ -4248,68 +3184,12 @@ class TkControlPanel:
             target_spacing=new_d,
             sample_step=self.visualizer.sample_step
         )
-        optimized = optimize_trajectory_arcs_postprocess(
-            raw_trajectory,
-            self.visualizer.mesh,
-            target_spacing=new_d,
-            sample_step=self.visualizer.sample_step
-        )
-        # 【修改5】：交互更新也走 CENTER 能量优化（迭代数可略少，保证响应速度）
-        # 搜索 update_spacing 方法中的这行：
-        self.visualizer.reset_energy_history()
-
-        # def refresh_iteration(preview, iteration, total_energy, energy_components):
-        #     self.visualizer.record_energy(iteration, total_energy)
-        #     # 1. 更新 VTK 中的 3D/2D 轨迹数据
-        #     self.visualizer.update_trajectory(
-        #         preview,
-        #         planning_frame,
-        #         metadata,
-        #         trajectory_2d=raw_trajectory,
-        #     )
-        #
-        #     # 2. 强制 VTK 窗口立即重绘当前帧
-        #     self.visualizer.window.Render()
-        #
-        #     # 3. 强制 Tkinter 立即刷新 GUI 事件队列（必须用 update()，不能用 update_idletasks()）
-        #     self.root.update()
-        #
-        #     cv = float(energy_components.get("uniform_metric", float("nan")))
-        #     cv_smooth = float(energy_components.get("uniform_metric_smoothed", float("nan")))
-        #     cv_delta = float(energy_components.get("uniform_delta", float("nan")))
-        #     cv_rel_delta = float(energy_components.get("uniform_relative_delta", float("nan")))
-        #     cv_rel_limit = float(energy_components.get("uniform_relative_tol", float("nan")))
-        #     cv_limit = float(energy_components.get("uniform_threshold", float("nan")))
-        #     stable_count = int(energy_components.get("uniform_stable_count", 0))
-        #     stable_needed = int(energy_components.get("uniform_patience", 0))
-        #     print(
-        #         f"\r中心轨迹优化中: {iteration}/1  "#500
-        #         f"E={total_energy:.6e}  "
-        #         f"cov={energy_components['coverage']:.3e}  "
-        #         f"spacing={energy_components['spacing']:.3e}  "
-        #         f"boundary={energy_components['boundary']:.3e}  "
-        #         f"smooth={energy_components['smooth']:.3e}  "
-        #         f"CV={cv:.6e}  EMA_CV={cv_smooth:.6e}  "
-        #         f"dCV={cv_delta:.3e}  limit={cv_limit:.3e}  "
-        #         f"rel_dCV={cv_rel_delta:.3e}  rel_limit={cv_rel_limit:.3e}  "
-        #         f"stable={stable_count}/{stable_needed}",
-        #         flush=True,
-        #     )
-        #
-        # optimized = optimize_center_trajectories_dual_blank_energy(
-        #     optimized,
-        #     self.visualizer.mesh,
-        #     iterations=1,#500
-        #     attract_weight=1.20,
-        #     elastic_weight=0.08,
-        #     influence_radius=6.0 * new_d,
-        #     anneal=0.97,
-        #     target_spacing=new_d,
-        #     sample_step=self.visualizer.sample_step,
-        #     on_iteration=refresh_iteration,
+        # optimized = optimize_trajectory_arcs_postprocess(
+        #     raw_trajectory, self.visualizer.mesh, sample_step=self.visualizer.sample_step,
         # )
+        # 3D 画优化后，2D 固定画初代
         self.visualizer.update_trajectory(
-            optimized, planning_frame, metadata, trajectory_2d=raw_trajectory
+            raw_trajectory, planning_frame, metadata, trajectory_2d=raw_trajectory
         )
         print(f"成功将目标间距 d 重新规划并更新为: {new_d:.6g}")
 
@@ -4340,12 +3220,83 @@ class TkControlPanel:
         messagebox.showinfo("完成", f"轨迹已导出:\n{self.visualizer.paq_path}")
         print(f"Exported PAQ trajectory: {self.visualizer.paq_path}")
 
-
 def tick_tkinter(obj, event, tk_panel: TkControlPanel):
     try:
         tk_panel.root.update()
     except tk.TclError:
         pass
+
+
+def _show_pca_result(mesh: trimesh.Trimesh, data: ObjUVData,
+                     trajectory: Sequence[TrajectorySegment], spacing: float) -> None:
+    """Show generic PCA scans in VTK and retain an interactive spacing UI."""
+    import vtk
+
+    center = np.asarray(data.uv, dtype=float).mean(axis=0)
+    _, _, vh = np.linalg.svd(np.asarray(data.uv, dtype=float) - center, full_matrices=False)
+    pc1, pc2 = vh[0], vh[1]
+    if np.cross(pc1, pc2) < 0.0:
+        pc2 = -pc2
+    scale = max(float(np.ptp(data.uv, axis=0).max()), 1.0)
+    def line_actor(points, color, width):
+        actor = vtk_actor(vtk_polyline(np.asarray(points, dtype=float)), color, width=width)
+        actor.GetProperty().LightingOff()
+        actor.GetProperty().SetOpacity(1.0)
+        return actor
+    window = vtk.vtkRenderWindow(); window.SetWindowName("PCA UV trajectory"); window.SetSize(1500, 850)
+    left, right = vtk.vtkRenderer(), vtk.vtkRenderer()
+    left.SetViewport(0.0, 0.0, 0.5, 1.0); right.SetViewport(0.5, 0.0, 1.0, 1.0)
+    for renderer in (left, right): renderer.SetBackground(0.96, 0.97, 0.98); window.AddRenderer(renderer)
+    left.AddActor(vtk_actor(vtk_mesh(mesh.vertices, mesh.faces), (0.35, 0.55, 0.72), opacity=0.45))
+    def add_trajectory(target):
+        actors = []
+        for seg in target:
+            if len(seg.xyz) >= 2: actors.append(line_actor(seg.xyz, (1.0, 0.05, 0.0), 4.0)); left.AddActor(actors[-1])
+            if len(seg.uv) >= 2: actors.append(line_actor(np.column_stack((seg.uv, np.zeros(len(seg.uv)))), (1.0, 0.05, 0.0), 3.0)); right.AddActor(actors[-1])
+        return actors
+    actors = add_trajectory(trajectory)
+    uv3 = np.column_stack((data.uv, np.zeros(len(data.uv))))
+    right.AddActor(vtk_actor(vtk_mesh(uv3, data.uv_faces), (0.45, 0.45, 0.45), opacity=0.35, wireframe=True))
+    # Blue PC1 is the offset axis; orange PC2 is the scan axis.
+    right.AddActor(line_actor(np.vstack((center - scale * pc1, center + scale * pc1)), (0.0, 0.1, 0.8), 4.0))
+    right.AddActor(line_actor(np.vstack((center - scale * pc2, center + scale * pc2)), (1.0, 0.5, 0.0), 4.0))
+    left.ResetCamera(); right.ResetCamera(); right.GetActiveCamera().SetParallelProjection(True)
+    interactor = vtk.vtkRenderWindowInteractor()
+    interactor.SetRenderWindow(window)
+    interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
+    interactor.Initialize()
+    window.Render()
+    control = tk.Tk(); control.title("PCA trajectory control")
+    control.geometry("320x130+30+60")
+    control.attributes("-topmost", True)
+    control.lift()
+    control.after_idle(lambda: control.attributes("-topmost", False))
+    tk.Label(control, text="目标间距 d:").grid(row=0, column=0, padx=8, pady=8)
+    spacing_var = tk.StringVar(value=f"{float(spacing):g}"); tk.Entry(control, textvariable=spacing_var, width=14).grid(row=0, column=1, padx=8, pady=8)
+    def update():
+        nonlocal actors
+        try: value = float(spacing_var.get()); updated = generate_pca_uv_trajectory(data, value, value / 4.0)
+        except (TypeError, ValueError): messagebox.showerror("错误", "目标间距 d 必须是大于 0 的有效数字。"); return
+        for actor in actors: left.RemoveActor(actor); right.RemoveActor(actor)
+        actors = add_trajectory(updated); left.ResetCamera(); right.ResetCamera(); window.Render()
+    tk.Button(control, text="更新轨迹", command=update).grid(row=1, column=0, columnspan=2, padx=8, pady=8)
+    def close_control():
+        try:
+            control.destroy()
+        finally:
+            interactor.TerminateApp()
+    control.protocol("WM_DELETE_WINDOW", close_control)
+
+    def pump_tk(_caller, _event):
+        try:
+            control.update()
+        except tk.TclError:
+            interactor.TerminateApp()
+    interactor.AddObserver("TimerEvent", pump_tk)
+    interactor.CreateRepeatingTimer(30)
+    interactor.Start()
+    if control.winfo_exists():
+        control.destroy()
 
 
 def _show_result(
@@ -4365,12 +3316,11 @@ def _show_result(
         spray_distance: float,
         trajectory_2d: Sequence[TrajectorySegment] | None = None,
 ) -> None:
-    """Run interactive visualizer without background center-energy optimization."""
+    """Run interactive visualizer with Tkinter event wheel integration."""
     visualizer = InteractiveVisualizer(
         mesh, data, precut_seam, cut_edges, sample_step, initial_spacing,
         csv_path, metadata_path, paq_path, trajectory_speed, spray_distance
     )
-    # 绘制传入的超椭圆拟合后轨迹
     visualizer.update_trajectory(trajectory, planning_frame, metadata, trajectory_2d=trajectory_2d)
     visualizer.reset_cameras()
     panel = TkControlPanel(visualizer)
@@ -4378,61 +3328,8 @@ def _show_result(
     visualizer.interactor.AddObserver("TimerEvent", lambda obj, ev: tick_tkinter(obj, ev, panel))
     visualizer.interactor.CreateRepeatingTimer(10)
 
-    # 1. 先渲染出 VTK 窗口
     visualizer.window.Render()
     visualizer.interactor.Initialize()
-
-    # # 2. 窗口打开后，实时进行 CENTER 双空白能量场实时优化渲染
-    # print("\n[开始实时能量场轨迹优化...]")
-
-    # visualizer.reset_energy_history()
-    #
-    # def live_iteration_callback(preview, iteration, total_energy, energy_components):
-    #     visualizer.record_energy(iteration, total_energy)
-    #     visualizer.update_trajectory(
-    #         preview, planning_frame, metadata, trajectory_2d=trajectory_2d
-    #     )
-    #     visualizer.window.Render()
-    #     panel.root.update()
-    #     cv = float(energy_components.get("uniform_metric", float("nan")))
-    #     cv_smooth = float(energy_components.get("uniform_metric_smoothed", float("nan")))
-    #     cv_delta = float(energy_components.get("uniform_delta", float("nan")))
-    #     cv_rel_delta = float(energy_components.get("uniform_relative_delta", float("nan")))
-    #     cv_rel_limit = float(energy_components.get("uniform_relative_tol", float("nan")))
-    #     cv_limit = float(energy_components.get("uniform_threshold", float("nan")))
-    #     stable_count = int(energy_components.get("uniform_stable_count", 0))
-    #     stable_needed = int(energy_components.get("uniform_patience", 0))
-    #     print(
-    #         f"\r实时优化进度: {iteration}/1  "  # 500
-    #         f"E={total_energy:.6e}  "
-    #         f"cov={energy_components['coverage']:.3e}  "
-    #         f"spacing={energy_components['spacing']:.3e}  "
-    #         f"boundary={energy_components['boundary']:.3e}  "
-    #         f"smooth={energy_components['smooth']:.3e}  "
-    #         f"CV={cv:.6e}  EMA_CV={cv_smooth:.6e}  "
-    #         f"dCV={cv_delta:.3e}  limit={cv_limit:.3e}  "
-    #         f"rel_dCV={cv_rel_delta:.3e}  rel_limit={cv_rel_limit:.3e}  "
-    #         f"stable={stable_count}/{stable_needed}",
-    #         flush=True,
-    #     )
-
-    # optimized_trajectory = optimize_center_trajectories_dual_blank_energy(
-    #     trajectory=list(trajectory),
-    #     mesh=mesh,
-    #     iterations=1,  # 500
-    #     attract_weight=1.20,
-    #     elastic_weight=0.08,
-    #     influence_radius=6.0 * initial_spacing,
-    #     anneal=0.97,
-    #     target_spacing=initial_spacing,
-    #     sample_step=sample_step,
-    #     on_iteration=live_iteration_callback,
-    # )
-    visualizer.current_trajectory = list(trajectory)
-    print("\n[轨迹准备就绪，开启可视化界面！]")
-    visualizer.current_trajectory = list(trajectory)
-
-    # 进入主事件循环
     visualizer.interactor.Start()
 
 
@@ -4442,32 +3339,25 @@ def _request_spacing(
         seam: PrecutSeam,
         cut_edges: np.ndarray,
         initial_spacing: float,
-        initial_a_max: float,  # 【新增】
-        initial_j_max: float,  # 【新增】
-) -> tuple[float | None, float, float]:  # 【修改返回值类型注解】
+) -> tuple[float | None, PlanningFrame]:
     from vtktrajdisplay import request_spacing
-    frame = _planning_frame(_resolve_main_seam_uv_segments(data, seam))
 
-    # 【修改】：传入 a_max 和 j_max，并接收三元组返回值
+    frame = _planning_frame(_resolve_main_seam_uv_segments(data, seam))
     result = request_spacing(
         mesh, data.uv, data.uv_faces, initial_spacing,
         cut_edges=cut_edges, planning_frame=frame,
-        initial_a_max=initial_a_max, initial_j_max=initial_j_max,  # 【新增参数】
     )
-
     if result is None:
-        return None, None, None
-
+        return None, frame
     if isinstance(result, dict):
-        try:
-            return float(result["d"]), float(result["a_max"]), float(result["j_max"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Spacing dialog returned incomplete trajectory limits.") from exc
-    try:
-        spacing, a_max, j_max = result
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Spacing dialog returned an unsupported result.") from exc
-    return float(spacing), float(a_max), float(j_max)
+        result = result.get("d")
+        if result is None:
+            raise ValueError("Spacing dialog returned no spacing value.")
+    if isinstance(result, (tuple, list, np.ndarray)):
+        if not len(result):
+            return None, frame
+        result = result[0]
+    return float(result), frame
 
 
 def _play_iteration_animation(mesh: trimesh.Trimesh, result_obj: Path) -> None:
@@ -4494,13 +3384,6 @@ def _parse_arguments() -> argparse.Namespace:
                         help=f"PAQ trajectory speed (default: {DEFAULT_TRAJECTORY_SPEED}).")
     parser.add_argument("--spray-distance", type=float, default=DEFAULT_SPRAY_DISTANCE,
                         help=f"Inward normal offset distance for PAQ export (default: {DEFAULT_SPRAY_DISTANCE}).")
-
-    # 【新增】：最大加速度和最大加加速度参数
-    parser.add_argument("--a-max", type=float, default=1000.0,
-                        help="Robot maximum acceleration in mm/s² (default: 1000.0).")
-    parser.add_argument("--j-max", type=float, default=5000.0,
-                        help="Robot maximum jerk in mm/s³ (default: 5000.0).")
-
     parser.add_argument("--no-animation", action="store_true", help="Skip the OptCuts iteration animation.")
     parser.add_argument("--no-show", action="store_true", help="Do not open the final VTK/OpenGL window.")
     return parser.parse_args()
@@ -4515,71 +3398,54 @@ def main() -> None:
     selected = args.mesh or _select_mesh_file()
     if not selected:
         return
-    selected_path = Path(selected).resolve()
-    if selected_path.suffix.lower() == ".json":
-        model_path, unfolded_obj = cutopt_cache.load(selected_path)
-        mesh = _load_mesh(str(model_path))
+    mesh = _load_mesh(selected)
+    boundary_count = len(ordered_boundary_loops(np.asarray(mesh.faces, dtype=np.int64)))
+    if boundary_count == 2:
         optcuts_mesh, precut_seam = _precut_two_boundaries(mesh)
-        if precut_seam is None:
-            raise ValueError("Cached source model must have exactly two openings.")
-        result_obj = unfolded_obj
-        data = _read_obj_uv_data(result_obj)
-        optimized_cut_edges = _read_obj_cut_edges(result_obj)
-        selected_path = model_path
-        print(f"Loaded OptCuts cache: {selected_path}")
+        print("Detected two boundaries: using three-point-section pre-cut.")
     else:
-        mesh = _load_mesh(str(selected_path))
-        optcuts_mesh, precut_seam = _precut_two_boundaries(mesh)
-        if precut_seam is None:
-            raise ValueError(
-                "Seam-aware trajectory planning requires the original burner mesh to have exactly two openings."
-            )
-        official_input = _prepare_official_input(optcuts_mesh)
-        _save_precut_seam(official_input, precut_seam)
-        result_obj = _run_official_optcuts(official_input)
-        data = _read_obj_uv_data(result_obj)
-        optimized_cut_edges = _read_obj_cut_edges(result_obj)
-        cutopt_cache.save(selected_path, result_obj)
-    if len(precut_seam.edges) and len(optimized_cut_edges):
+        optcuts_mesh, precut_seam = mesh, None
+        print(f"Detected {boundary_count} boundaries: skipping pre-cut and using direct OptCuts.")
+    official_input = _prepare_official_input(optcuts_mesh)
+    _save_precut_seam(official_input, precut_seam)
+    result_obj = _run_official_optcuts(official_input)
+    data = _read_obj_uv_data(result_obj)
+    optimized_cut_edges = _read_obj_cut_edges(result_obj)
+    if precut_seam is not None and len(precut_seam.edges) and len(optimized_cut_edges):
         cut_edges = np.vstack([precut_seam.edges, optimized_cut_edges])
-    elif len(precut_seam.edges):
+    elif precut_seam is not None and len(precut_seam.edges):
         cut_edges = precut_seam.edges
     else:
         cut_edges = optimized_cut_edges
-    if args.no_show:
+    if args.no_show or precut_seam is None:
         selected_spacing = args.spacing
-        selected_a_max = args.a_max
-        selected_j_max = args.j_max
     else:
-        # 【修改】：调用 _request_spacing 时传入 a_max 和 j_max
-        selected_spacing, selected_a_max, selected_j_max = _request_spacing(
-            mesh, data, precut_seam, cut_edges, args.spacing,
-            initial_a_max=args.a_max,  # 【新增】
-            initial_j_max=args.j_max,  # 【新增】
+        selected_spacing, _ = _request_spacing(
+            mesh, data, precut_seam, cut_edges, args.spacing
         )
-
-    if selected_spacing is None:
-        print("Trajectory generation cancelled.")
-        return
+        if selected_spacing is None:
+            print("Trajectory generation cancelled.")
+            return
     sample_step_val = selected_spacing / 4.0 if args.sample_step <= 0.0 else args.sample_step
-    raw_trajectory, planning_frame, metadata = generate_seam_aware_trajectory(
-        data, precut_seam, target_spacing=selected_spacing, sample_step=sample_step_val
-    )
+    # All trajectory offsets use the same global PCA frame after UV
+    # parameterization.  The two-boundary pre-cut remains a topology step only;
+    # it no longer changes the scan direction or spacing logic.
+    raw_trajectory = generate_pca_uv_trajectory(data, selected_spacing, sample_step_val)
+    planning_frame = None
+    metadata = {
+        "trajectory_mode": "PCA_UV",
+        "boundary_count": boundary_count,
+        "precut_applied": precut_seam is not None,
+        "spacing": float(selected_spacing),
+        "sample_step": float(sample_step_val),
+    }
 
-    # 【修改】：在调用优化函数时，传入选定的 a_max 和 j_max
-    # 找到原有这句：
-    # arc_trajectory = optimize_trajectory_arcs_postprocess(...)
-
-    # 替换为：
-    arc_trajectory = optimize_trajectory_arcs_postprocess(
-        trajectory=raw_trajectory,
-        mesh=mesh,
-        target_spacing=selected_spacing,
-        sample_step=sample_step_val,
-    )
-
-    # 【注意】：不要在这里直接调用 optimize_center_trajectories_dual_blank_energy！
-    # 把它移入 _show_result 中，窗口打开后再实时边计算边渲染。
+    # # 2. 纯 3D 后处理优化（只依赖 mesh）
+    # optimized_trajectory = optimize_trajectory_arcs_postprocess(
+    #     trajectory=raw_trajectory,
+    #     mesh=mesh,
+    #     sample_step=sample_step_val,
+    # )
 
     selected_path = Path(selected)
     csv_path = Path(args.trajectory_out) if args.trajectory_out else selected_path.with_name(
@@ -4591,18 +3457,14 @@ def main() -> None:
     paq_path = Path(args.paq_out) if args.paq_out else selected_path.with_name(
         selected_path.stem + "_optcuts_trajectory_PAQ.txt"
     )
-
-    print(f"Pre-cut shortest-boundary seam edges: {len(precut_seam.edges)}")
+    _export_paq_trajectory(paq_path, mesh, raw_trajectory,
+                           args.trajectory_speed, args.spray_distance)
+    _export_trajectory(csv_path, metadata_path, raw_trajectory, metadata)
+    print(f"Pre-cut shortest-boundary seam edges: {len(precut_seam.edges) if precut_seam is not None else 0}")
     print(f"Additional detected OptCuts seam edges: {len(optimized_cut_edges)}")
-    print(f"Trajectory events: {len(arc_trajectory)}")
-
+    print(f"Trajectory events: {len(raw_trajectory)}")
     if not args.no_show:
-        _show_result(
-            mesh, data, precut_seam, cut_edges, arc_trajectory, planning_frame, metadata,
-            selected_spacing, sample_step_val, csv_path, metadata_path,
-            paq_path, args.trajectory_speed, args.spray_distance,
-            trajectory_2d=raw_trajectory,
-        )
+        _show_pca_result(mesh, data, raw_trajectory, selected_spacing)
     if not args.no_animation:
         _play_iteration_animation(optcuts_mesh, result_obj)
 

@@ -4638,6 +4638,11 @@ def _request_spacing(
 
     if result is None:
         return None, None, None
+    if isinstance(result, dict):
+        try:
+            return float(result["d"]), float(result["a_max"]), float(result["j_max"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Spacing dialog returned incomplete trajectory limits.") from exc
 
     spacing, a_max, j_max = result
     return spacing, a_max, j_max
