@@ -3226,6 +3226,11 @@ def _optimize_trajectory_region_energy(
     if moving_region not in {"CENTER", "LOWER", "UPPER"}:
         raise ValueError("moving_region must be 'CENTER', 'LOWER', or 'UPPER'.")
 
+    # LOWER/UPPER are fitted boundary references.  They must never be moved
+    # by the energy relaxation; only CENTER is an active optimization region.
+    if moving_region != "CENTER":
+        return list(trajectory)
+
     lower_idx = [i for i, s in enumerate(trajectory)
                  if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "LOWER"]
     upper_idx = [i for i, s in enumerate(trajectory)
@@ -3750,7 +3755,7 @@ def _optimize_trajectory_region_energy(
         P += F * np.clip(track_step / track_norm, 0.0, 1.0)[:, None]
 
         # 投影回 3D 曲面 + 钉死端点
-        P, _, _ = trimesh.proximity.closest_point(mesh, P)
+        P, _, _ = _closest_points_robust(mesh, P)
         new_lines = []
         for li in range(num_lines):
             a, b = int(offsets[li]), int(offsets[li + 1])
@@ -4055,7 +4060,8 @@ def optimize_center_trajectories_dual_blank_energy(
         "uniform_min_iterations": iterations + 1,
         "return_best_uniform": False,
     })
-    red_motion_active = True
+    # Boundary regions are fixed references; only CENTER is relaxed.
+    red_motion_active = False
     # Keep the uniformity EMA across outer iterations.  Each regional pass
     # intentionally runs one step, so the inner optimizer cannot own this
     # state or every reported EMA would equal the current CV.
@@ -4946,6 +4952,65 @@ def _orientation_quaternion(tangent: np.ndarray, inward_normal: np.ndarray) -> n
     return _quaternion_from_matrix(_orientation_matrix(tangent, inward_normal))
 
 
+def _closest_points_robust(
+        mesh: trimesh.Trimesh, points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Use a reliable fallback when trimesh AABB candidates are empty."""
+    points = np.asarray(points, dtype=float)
+    finite = np.isfinite(points).all(axis=1)
+    query = points.copy()
+    if not np.all(finite):
+        if not len(mesh.vertices):
+            raise ValueError("Mesh projection received non-finite points.")
+        query[~finite] = np.mean(np.asarray(mesh.vertices, dtype=float), axis=0)
+    try:
+        return trimesh.proximity.closest_point(mesh, query)
+    except (IndexError, ValueError):
+        return trimesh.proximity.closest_point_naive(mesh, query)
+
+
+def _smooth_mesh_normals_at_points(
+        mesh: trimesh.Trimesh, points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return closest surface points and barycentrically interpolated normals."""
+    points = np.asarray(points, dtype=float)
+    closest = points.copy()
+    face_ids = np.full(len(points), -1, dtype=np.int64)
+    finite = np.isfinite(points).all(axis=1)
+    if np.any(finite):
+        valid_points = points[finite]
+        try:
+            close_valid, _, ids_valid = trimesh.proximity.closest_point(mesh, valid_points)
+        except (IndexError, ValueError):
+            close_valid, _, ids_valid = trimesh.proximity.closest_point_naive(mesh, valid_points)
+        closest[finite] = np.asarray(close_valid, dtype=float)
+        face_ids[finite] = np.asarray(ids_valid, dtype=np.int64)
+    normals = np.zeros_like(points)
+    valid = (face_ids >= 0) & (face_ids < len(mesh.faces))
+    if np.any(valid):
+        ids = face_ids[valid]
+        triangles = np.asarray(mesh.triangles, dtype=float)[ids]
+        try:
+            bary = trimesh.triangles.points_to_barycentric(triangles, closest[valid])
+            vertex_normals = np.asarray(mesh.vertex_normals, dtype=float)[mesh.faces[ids]]
+            normals[valid] = np.einsum("ij,ijk->ik", bary, vertex_normals)
+        except Exception:
+            normals[valid] = np.asarray(mesh.face_normals, dtype=float)[ids]
+        face_normals = np.asarray(mesh.face_normals, dtype=float)[ids]
+        valid_indices = np.flatnonzero(valid)
+        flip = np.einsum("ij,ij->i", normals[valid], face_normals) < 0.0
+        normals[valid_indices[flip]] *= -1.0
+    missing = np.linalg.norm(normals, axis=1) <= EPS
+    if np.any(missing):
+        safe_ids = np.clip(face_ids[missing], 0, max(len(mesh.face_normals) - 1, 0))
+        if len(mesh.face_normals):
+            normals[missing] = np.asarray(mesh.face_normals, dtype=float)[safe_ids]
+        else:
+            normals[missing] = np.array([0.0, 0.0, 1.0])
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), EPS)
+    return closest, normals
+
+
 def _export_matrix_trajectory(
         path: Path,
         mesh: trimesh.Trimesh,
@@ -4964,12 +5029,12 @@ def _export_matrix_trajectory(
         return
 
     points = np.asarray([item[1] for item in point_segments], dtype=float)
-    _, _, face_ids = trimesh.proximity.closest_point(mesh, points)
-    normals = np.asarray(mesh.face_normals, dtype=float)[np.asarray(face_ids, dtype=np.int64)]
+    closest, normals = _smooth_mesh_normals_at_points(mesh, points)
     inward_normals = -normals
     surface_mask = np.asarray(
         [segment.kind == "SURFACE_SCAN" for segment, _ in point_segments], dtype=bool,
     )
+    points[surface_mask] = closest[surface_mask]
     export_points = points.copy()
     export_points[surface_mask] += normals[surface_mask] * float(spray_distance)
 
@@ -5066,10 +5131,7 @@ def _export_paq_trajectory(
         return
 
     surface_points = np.asarray([item[1] for item in point_segments], dtype=float)
-    closest, _, face_ids = trimesh.proximity.closest_point(mesh, surface_points)
-    normals = np.asarray(mesh.face_normals, dtype=float)[
-        np.asarray(face_ids, dtype=np.int64)
-    ]
+    closest, normals = _smooth_mesh_normals_at_points(mesh, surface_points)
     inward_normals = -normals
 
     export_points = surface_points.copy()
@@ -5077,6 +5139,7 @@ def _export_paq_trajectory(
         [segment.kind == "SURFACE_SCAN" for segment, _, _ in point_segments],
         dtype=bool,
     )
+    surface_points[surface_mask] = closest[surface_mask]
     export_points[surface_mask] = surface_points[surface_mask] + normals[
         surface_mask
     ] * float(spray_distance)
