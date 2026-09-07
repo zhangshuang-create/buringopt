@@ -2552,6 +2552,41 @@ def apply_tangent_circle_fillet(
                   "case_a": 0, "case_b": 0, "drop_center_limit": 0,
                   "drop_short": 0, "drop_degenerate": 0}
 
+    def lock_v_apex_by_arclength(
+            points: np.ndarray,
+            apex_point: np.ndarray,
+            arc_lo: int | None = None,
+            arc_hi: int | None = None,
+    ) -> np.ndarray:
+        """Lock the analytic arc and L_total/4 on each side of the V apex."""
+        pts = np.asarray(points, dtype=float)
+        locked = np.zeros(len(pts), dtype=bool)
+        if len(pts) == 0:
+            return locked
+        if arc_lo is not None and arc_hi is not None:
+            lo = max(0, min(int(arc_lo), len(pts) - 1))
+            hi = max(lo, min(int(arc_hi), len(pts) - 1))
+            locked[lo:hi + 1] = True
+        if len(pts) < 2:
+            locked[:] = True
+            return locked
+        edge_len = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        target = 0.25 * float(np.sum(edge_len))
+        apex = np.asarray(apex_point, dtype=float).reshape(1, 3)
+        apex_idx = int(np.argmin(np.linalg.norm(pts - apex, axis=1)))
+        locked[apex_idx] = True
+        for direction in (-1, 1):
+            acc = 0.0
+            idx = apex_idx
+            while (idx > 0 if direction < 0 else idx < len(pts) - 1):
+                next_idx = idx + direction
+                acc += float(edge_len[min(idx, next_idx)])
+                locked[next_idx] = True
+                idx = next_idx
+                if acc >= target:
+                    break
+        return locked
+
     def project_partial_b_arc(
             points_3d: np.ndarray,
             t1_index: int,
@@ -2723,15 +2758,6 @@ def apply_tangent_circle_fillet(
                     arc_start = max(0, len(x_left) - 1)
                     arc_end = min(len(curve_x_loc) - 1,
                                   arc_start + len(x_arc_seg) - 1)
-                    # Keep the arc fixed, with the configured total guard
-                    # split evenly across its two straight-arm sides.
-                    lock_pad = max(1, int(math.ceil(
-                        0.5 * arc_lock_guard_d * d / effective_step
-                    )))
-                    locked_mask = np.zeros(len(curve_x_loc), dtype=bool)
-                    locked_mask[max(0, arc_start - lock_pad):
-                                min(len(locked_mask), arc_end + lock_pad + 1)] = True
-
                     curve_3d = M[None, :] + np.outer(curve_x_loc - a, X_dir) + np.outer(curve_y_loc, Y_dir)
                     curve_3d[0] = P1
                     curve_3d[-1] = P3
@@ -2743,6 +2769,10 @@ def apply_tangent_circle_fillet(
                     curve_3d, _, _ = trimesh.proximity.closest_point(mesh, curve_3d)
                     curve_3d[0] = P1
                     curve_3d[-1] = P3
+                    fitted_apex = M + b * Y_dir
+                    locked_mask = lock_v_apex_by_arclength(
+                        curve_3d, fitted_apex, arc_start, arc_end
+                    )
 
                     n_pts = len(curve_3d)
                     phases = np.where(np.arange(n_pts) < n_pts // 2, 0, 1).astype(int)
@@ -2926,18 +2956,12 @@ def apply_tangent_circle_fillet(
             keep_mask = np.r_[True, edges > 1e-7]
             final_xyz = final_xyz[keep_mask]
 
-        # Lock the analytic B-arc plus the configured side guard before global
-        # spacing relaxation.  Apply the same duplicate-point mask so the
-        # metadata remains aligned with final_xyz.
-        # Keep the arc fixed, with the configured total guard split evenly
-        # across its two straight-arm sides.
-        lock_pad = max(1, int(math.ceil(
-            0.5 * arc_lock_guard_d * d / effective_step
-        )))
-        locked_mask = np.zeros(len(arc_points), dtype=bool)
-        lock_lo = max(0, int(t1_index) - lock_pad)
-        lock_hi = min(len(locked_mask), int(t2_index) + lock_pad + 1)
-        locked_mask[lock_lo:lock_hi] = True
+        # Lock the analytic B-arc and the L_total/4 neighborhoods around the
+        # V apex before global spacing relaxation. Apply the same duplicate-
+        # point mask so metadata remains aligned with final_xyz.
+        locked_mask = lock_v_apex_by_arclength(
+            arc_points, p2_pt, t1_index, t2_index
+        )
         if len(final_xyz) != len(locked_mask):
             locked_mask = locked_mask[keep_mask]
 
@@ -3175,6 +3199,7 @@ def _optimize_trajectory_region_energy(
         self_repel_weight: float = 0.30,  # 线上节点互斥力
         arc_repel_weight: float = 3.50,  # 固定样条边界排斥权重（保留参数名以兼容旧调用）
         elastic_weight: float = 0.10,  # 顺向平滑刚度
+        boundary_smooth_weight: float = 2.40,  # LOWER/UPPER 专用沿线平滑刚度
         transverse_weight: float = 0.60,  # 跨线 Δ 变动均摊刚度
         pair_attract_weight: float = 6.00,
         pair_repel_weight: float = 6.00,
@@ -3226,11 +3251,6 @@ def _optimize_trajectory_region_energy(
     if moving_region not in {"CENTER", "LOWER", "UPPER"}:
         raise ValueError("moving_region must be 'CENTER', 'LOWER', or 'UPPER'.")
 
-    # LOWER/UPPER are fitted boundary references.  They must never be moved
-    # by the energy relaxation; only CENTER is an active optimization region.
-    if moving_region != "CENTER":
-        return list(trajectory)
-
     lower_idx = [i for i, s in enumerate(trajectory)
                  if s.kind == "SURFACE_SCAN" and getattr(s, "region", "") == "LOWER"]
     upper_idx = [i for i, s in enumerate(trajectory)
@@ -3241,8 +3261,7 @@ def _optimize_trajectory_region_energy(
         moving_idx = center_idx
     else:
         red_candidates = lower_idx if moving_region == "LOWER" else upper_idx
-        # A red region needs at least three paths before spatial ordering is
-        # meaningful.  Select the four paths closest to the CENTER-side
+        # Select the half of the red paths closest to the CENTER-side
         # boundary, using whole-path mean distance rather than a local spike.
         # Store them far-to-near so Line 0 is the outer reference path.
         if len(red_candidates) >= 3 and center_idx:
@@ -3282,11 +3301,12 @@ def _optimize_trajectory_region_energy(
                     distance = float(np.mean(boundary_tree.query(points)[0]))
                 ranked.append((distance, index))
             ranked.sort(key=lambda item: item[0])
-            moving_idx = [index for _, index in ranked[:4]][::-1]
+            moving_count = max(1, int(np.ceil(len(ranked) / 2.0)))
+            moving_idx = [index for _, index in ranked[:moving_count]][::-1]
         else:
             # With zero, one, or two candidates keep their established order;
             # there is no reliable multi-line ordering to infer.
-            moving_idx = red_candidates[:4]
+            moving_idx = red_candidates[:max(1, int(np.ceil(len(red_candidates) / 2.0)))]
 
     if not moving_idx:
         print(f"[Energy optimizer skipped] no SURFACE_SCAN segment is tagged {moving_region}.")
@@ -3627,10 +3647,19 @@ def _optimize_trajectory_region_energy(
         np.add.at(F, c_, (P[c_] - P[r_]) / dv[:, None] * mag[:, None])
 
         # --- D. 沿线纵向顺向平滑 ---
+        # The red boundary paths receive a dedicated, stronger Laplacian
+        # force so pair-spacing updates cannot leave triangulation-scale
+        # corrugations along a single trajectory.
+        line_smooth_weight = (
+            elastic_weight if moving_region == "CENTER"
+            else boundary_smooth_weight
+        )
         for li in range(num_lines):
             a, b = int(offsets[li]), int(offsets[li + 1])
             if b - a > 2:
-                F[a + 1:b - 1] += elastic_weight * (P[a:b - 2] - 2 * P[a + 1:b - 1] + P[a + 2:b])
+                F[a + 1:b - 1] += line_smooth_weight * (
+                    P[a:b - 2] - 2 * P[a + 1:b - 1] + P[a + 2:b]
+                )
 
         # --- E. 跨线网格调和中点场 ---
         # Do not use list-order midpoint forces: list order is not spatial
@@ -4060,8 +4089,9 @@ def optimize_center_trajectories_dual_blank_energy(
         "uniform_min_iterations": iterations + 1,
         "return_best_uniform": False,
     })
-    # Boundary regions are fixed references; only CENTER is relaxed.
-    red_motion_active = False
+    # Enable relaxation only for the boundary paths closest to CENTER;
+    # the remaining LOWER/UPPER paths stay fixed as geometric references.
+    red_motion_active = True
     # Keep the uniformity EMA across outer iterations.  Each regional pass
     # intentionally runs one step, so the inner optimizer cannot own this
     # state or every reported EMA would equal the current CV.
@@ -5032,7 +5062,8 @@ def _export_matrix_trajectory(
     closest, normals = _smooth_mesh_normals_at_points(mesh, points)
     inward_normals = -normals
     surface_mask = np.asarray(
-        [segment.kind == "SURFACE_SCAN" for segment, _ in point_segments], dtype=bool,
+        [segment.kind in {"SURFACE_SCAN", "SEAM_TRANSITION"}
+         for segment, _ in point_segments], dtype=bool,
     )
     points[surface_mask] = closest[surface_mask]
     export_points = points.copy()
@@ -5136,7 +5167,8 @@ def _export_paq_trajectory(
 
     export_points = surface_points.copy()
     surface_mask = np.asarray(
-        [segment.kind == "SURFACE_SCAN" for segment, _, _ in point_segments],
+        [segment.kind in {"SURFACE_SCAN", "SEAM_TRANSITION"}
+         for segment, _, _ in point_segments],
         dtype=bool,
     )
     surface_points[surface_mask] = closest[surface_mask]
@@ -6386,7 +6418,7 @@ def _parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--arc-lock-guard-d", type=float, default=2.0,
-        help="Total straight-arm guard locked around each arc, in multiples of d (default: 2).",
+        help="Legacy compatibility parameter; V-arc locking now uses one quarter of each track's total arc length.",
     )
 
     # 【新增】：最大加速度和最大加加速度参数
